@@ -1584,6 +1584,9 @@ pub enum NewWorkspaceSource {
         previous_active_window: Option<WindowId>,
         shell: Option<AvailableShell>,
     },
+    TabConfig {
+        config: crate::tab_configs::TabConfig,
+    },
     FromTemplate {
         window_template: launch_config::WindowTemplate,
     },
@@ -1678,6 +1681,7 @@ impl NewWorkspaceSource {
                 previous_active_window,
                 ..
             } => *previous_active_window,
+            Self::TabConfig { .. } => None,
             Self::TransferredTab {
                 source_window_id, ..
             } => Some(*source_window_id),

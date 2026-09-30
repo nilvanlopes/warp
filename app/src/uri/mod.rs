@@ -31,6 +31,7 @@ use crate::drive::{OpenWarpDriveObjectArgs, OpenWarpDriveObjectSettings};
 use crate::features::FeatureFlag;
 use crate::launch_configs::launch_config::LaunchConfig;
 use crate::linear::{LinearAction, LinearIssueWork};
+use crate::pane_group::NewTerminalOptions;
 use crate::root_view::{
     NewWorkspaceSource, OpenLaunchConfigArg, open_new_window_get_handles,
     open_new_with_workspace_source,
@@ -41,6 +42,7 @@ use crate::settings_view::{
     OpenTeamsSettingsModalArgs, SettingsSection, settings_widget_deeplink_target,
 };
 use crate::tab_configs::TabConfig;
+use crate::terminal::available_shells::AvailableShells;
 use crate::user_config::{load_launch_configs, load_tab_configs, tab_configs_dir};
 use crate::util::openable_file_type::{
     is_file_openable_in_warp, is_markdown_file, is_runnable_shell_script,
@@ -815,21 +817,32 @@ fn handle_tab_config_uri(primary_window_id: Option<WindowId>, url: &Url, ctx: &m
         return;
     };
 
+    #[cfg(feature = "local_tty")]
+    if crate::pane_group::tab_config_has_unavailable_wsl_shell(&config, ctx) {
+        log::warn!(
+            "tab config '{}' references an unavailable WSL distribution",
+            config.name
+        );
+        return;
+    }
+
     let force_new_window = url
         .query_pairs()
         .any(|(k, v)| k == "new_window" && matches!(v.as_ref(), "1" | "true"));
 
-    let target_window_id = if force_new_window {
-        None
-    } else {
-        primary_window_id.filter(|id| WorkspaceRegistry::as_ref(ctx).get(*id, ctx).is_some())
-    };
+    if force_new_window {
+        open_new_with_workspace_source(NewWorkspaceSource::TabConfig { config }, ctx);
+        return;
+    }
+
+    let target_window_id =
+        primary_window_id.filter(|id| WorkspaceRegistry::as_ref(ctx).get(*id, ctx).is_some());
 
     let workspace = match target_window_id {
         Some(window_id) => WorkspaceRegistry::as_ref(ctx).get(window_id, ctx),
         None => {
-            let new_window_id = open_new_window_get_handles(None, ctx).0;
-            WorkspaceRegistry::as_ref(ctx).get(new_window_id, ctx)
+            open_new_with_workspace_source(NewWorkspaceSource::TabConfig { config }, ctx);
+            return;
         }
     };
 
@@ -929,7 +942,9 @@ fn parse_auto_handoff_trigger(url: &Url) -> AutoCloudHandoffTrigger {
 #[derive(Debug)]
 enum Action {
     NewTab,
-    NewWindow,
+    NewWindow {
+        shell: Option<String>,
+    },
     OpenFileEditor {
         path: PathBuf,
         line_col: Option<LineAndColumnArg>,
@@ -952,7 +967,11 @@ impl Action {
     fn parse(url: &Url) -> Result<Self> {
         match url.path() {
             "/new_tab" => Ok(Self::NewTab),
-            "/new_window" => Ok(Self::NewWindow),
+            "/new_window" => Ok(Self::NewWindow {
+                shell: url
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "shell").then(|| value.into_owned())),
+            }),
             "/open_file_editor" => {
                 let (path, line_col) = parse_open_file_editor_url(url)?;
                 Ok(Self::OpenFileEditor { path, line_col })
@@ -985,17 +1004,48 @@ impl Action {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let primary_window_id = self.window_behavior_hint().resolve(primary_window_id, ctx);
         match self {
-            Self::NewTab | Self::NewWindow => {
-                let window_id = if let Self::NewTab = self {
-                    primary_window_id
-                } else {
-                    None
-                };
+            Self::NewTab => {
                 let Some(path) = parse_tab_path(url) else {
                     log::warn!("Could not parse path to open a new tab/window");
                     return;
                 };
-                open_file(window_id, path, ctx);
+                open_file(primary_window_id, path, ctx);
+            }
+            Self::NewWindow { shell } => {
+                if let Some(shell_id) = shell {
+                    #[cfg(feature = "local_tty")]
+                    {
+                        let Some(shell) = AvailableShells::as_ref(ctx).find_by_id(shell_id) else {
+                            log::warn!(
+                                "Could not resolve shell id from new window URI: {shell_id}"
+                            );
+                            return;
+                        };
+
+                        open_new_with_workspace_source(
+                            NewWorkspaceSource::Session {
+                                options: Box::new(NewTerminalOptions {
+                                    shell: Some(shell),
+                                    ..Default::default()
+                                }),
+                                initial_team_uid: None,
+                            },
+                            ctx,
+                        );
+                    }
+                    #[cfg(not(feature = "local_tty"))]
+                    {
+                        let _ = shell_id;
+                        log::warn!("new window shell selection requires local_tty support");
+                    }
+                    return;
+                }
+
+                let Some(path) = parse_tab_path(url) else {
+                    log::warn!("Could not parse path to open a new tab/window");
+                    return;
+                };
+                open_file(None, path, ctx);
             }
             Self::OpenFileEditor { path, line_col } => {
                 #[cfg(feature = "local_fs")]
@@ -1225,7 +1275,7 @@ impl Action {
                 title: "New tab created".to_owned(),
                 description: "Go to Warp to see your new tab.".to_owned(),
             }),
-            Self::NewWindow => W::Nothing,
+            Self::NewWindow { .. } => W::Nothing,
         }
     }
 }

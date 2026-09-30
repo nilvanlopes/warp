@@ -41,6 +41,8 @@ mod global_resource_handles;
 mod gpu_state;
 mod input_classifier;
 mod interval_timer;
+#[cfg(windows)]
+mod jumplist;
 mod linear;
 #[cfg(feature = "local_fs")]
 mod local_control;
@@ -755,6 +757,14 @@ pub fn run() -> Result<()> {
     // Perform any necessary platform-specific initialization.
     platform::init();
 
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--launcher-capabilities")
+    {
+        print_launcher_capabilities();
+        return Ok(());
+    }
+
     // Ensure feature flags are initialized before parsing command-line arguments.
     features::init_feature_flags();
     if let Some(args) = warp_cli::local_control::ControlArgs::from_control_mode_env() {
@@ -850,6 +860,25 @@ pub fn run() -> Result<()> {
         args: args.into_app_args(),
         api_key,
     })
+}
+
+/// Prints the narrow, read-only contract used by external launchers to decide whether this
+/// executable supports the native WSL Tab Config integration.
+fn print_launcher_capabilities() {
+    let capabilities = serde_json::json!({
+        "version": 1,
+        "native_wsl_tab_config": true,
+        "uri_scheme": warp_core::channel::ChannelState::url_scheme(),
+        "tab_configs_dir": warp_core::paths::data_dir()
+            .join("tab_configs")
+            .to_string_lossy(),
+        "build_id": format!(
+            "{}-{}",
+            warp_core::channel::ChannelState::app_id(),
+            warp_core::channel::ChannelState::app_version().unwrap_or(env!("CARGO_PKG_VERSION")),
+        ),
+    });
+    println!("{capabilities}");
 }
 
 /// Runs a parsed Warp worker command.
@@ -1873,6 +1902,9 @@ pub(crate) fn initialize_app(
 
     #[cfg(feature = "local_tty")]
     terminal::available_shells::register(ctx);
+
+    #[cfg(all(windows, feature = "local_tty"))]
+    jumplist::update(ctx);
 
     // Add truly global actions that don't depend on the existence of any view here
     ctx.add_global_action("app:toggle_user_ps1", move |_args: &(), ctx| {

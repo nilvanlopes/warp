@@ -401,7 +401,9 @@ windows = { workspace = true, features = [
     "Win32_Security",
     "Win32_Storage",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_EnhancedStorage",
     "Win32_System_Console",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Environment",
     "Win32_System_IO",
@@ -409,7 +411,11 @@ windows = { workspace = true, features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    "Win32_System_Variant",
     "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-registry = { workspace = true }

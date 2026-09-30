@@ -4173,6 +4173,10 @@ impl Workspace {
                 self.open_launch_config_window(window_template, ctx);
                 self.check_and_trigger_onboarding(ctx);
             }
+            NewWorkspaceSource::TabConfig { config } => {
+                self.open_tab_config(config, ctx);
+                self.check_and_trigger_onboarding(ctx);
+            }
             NewWorkspaceSource::Session { options, .. } => {
                 self.add_tab_with_pane_layout(
                     PanesLayout::SingleTerminal(options),
@@ -4328,6 +4332,7 @@ impl Workspace {
             } => *vertical_tabs_panel_open,
             NewWorkspaceSource::Empty { .. }
             | NewWorkspaceSource::FromTemplate { .. }
+            | NewWorkspaceSource::TabConfig { .. }
             | NewWorkspaceSource::Session { .. }
             | NewWorkspaceSource::AgentSession { .. }
             | NewWorkspaceSource::AmbientAgent

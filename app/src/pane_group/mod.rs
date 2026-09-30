@@ -254,6 +254,21 @@ fn get_minimum_pane_size(app: &AppContext) -> f32 {
 ///    `shell`.
 #[cfg(feature = "local_tty")]
 fn resolve_tab_config_shell(name: &str, ctx: &AppContext) -> Option<AvailableShell> {
+    if let Some(distro) = name.strip_prefix("wsl:") {
+        let distro = distro.trim();
+        if distro.is_empty() {
+            return None;
+        }
+        return AvailableShells::as_ref(ctx)
+            .get_available_shells()
+            .find(|shell| {
+                shell
+                    .wsl_distro()
+                    .is_some_and(|available| available.eq_ignore_ascii_case(distro))
+            })
+            .cloned();
+    }
+
     if name.contains(std::path::MAIN_SEPARATOR) {
         return AvailableShell::try_from(name).ok();
     }
@@ -263,6 +278,18 @@ fn resolve_tab_config_shell(name: &str, ctx: &AppContext) -> Option<AvailableShe
     }
 
     AvailableShell::try_from(name).ok()
+}
+
+#[cfg(feature = "local_tty")]
+pub(crate) fn tab_config_has_unavailable_wsl_shell(
+    config: &crate::tab_configs::TabConfig,
+    ctx: &AppContext,
+) -> bool {
+    config.panes.iter().any(|pane| {
+        pane.shell.as_deref().is_some_and(|shell| {
+            shell.starts_with("wsl:") && resolve_tab_config_shell(shell, ctx).is_none()
+        })
+    })
 }
 const WARP_SHELL_COMPATIBILITY_DOCS: &str =
     "https://docs.warp.dev/getting-started/supported-shells";

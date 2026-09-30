@@ -392,6 +392,23 @@ fn test_action_create_environment_parse() {
 }
 
 #[test]
+fn test_action_new_window_shell_parse() {
+    let url = Url::parse(&format!(
+        "{}://action/new_window?shell=local%3AC%3A%5CProgram%20Files%5CPowerShell%5C7%5Cpwsh.exe",
+        ChannelState::url_scheme()
+    ))
+    .unwrap();
+
+    let action = Action::parse(&url).unwrap();
+    assert!(matches!(
+        action,
+        Action::NewWindow {
+            shell: Some(shell)
+        } if shell == r"local:C:\Program Files\PowerShell\7\pwsh.exe"
+    ));
+}
+
+#[test]
 fn test_action_focus_cloud_mode_parse() {
     let url = Url::parse(&format!(
         "{}://action/focus_cloud_mode",

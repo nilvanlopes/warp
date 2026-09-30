@@ -952,6 +952,22 @@ impl AvailableShells {
             })
             .cloned()
     }
+
+    /// Finds a discovered shell by its stable identifier.
+    ///
+    /// Native launch surfaces use this identifier so URI data is resolved
+    /// against the current discovery snapshot instead of reconstructing a
+    /// shell from untrusted input.
+    pub fn find_by_id(&self, id: &str) -> Option<AvailableShell> {
+        self.shells
+            .iter()
+            .find(|shell| {
+                shell
+                    .id()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(id))
+            })
+            .cloned()
+    }
 }
 
 /// Returns whether two shell command names are equivalent when resolving a
