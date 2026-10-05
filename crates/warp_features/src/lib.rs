@@ -887,6 +887,10 @@ pub enum FeatureFlag {
     /// connect a Grok subscription instead of pasting an API key.
     SuperGrok,
 
+    /// Gates connecting a ChatGPT subscription via Sign in with ChatGPT.
+    /// Account linking is server-side (iss+client_id+sub), not local tokens.
+    ChatGPTSubscription,
+
     /// Gates Gemini Enterprise (GEAP) BYOLLM, which lets users
     /// route eliglible models to GEAP instead of Warp-managed inference.
     GeminiEnterprise,
@@ -1081,6 +1085,7 @@ pub const RELEASE_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::Changelog,
     FeatureFlag::CrashReporting,
     FeatureFlag::VideoRecording,
+    FeatureFlag::WindowsVideoRecording,
     FeatureFlag::ImeMarkedText,
     // Remote server binary is not yet supported on Windows.
     #[cfg(not(windows))]

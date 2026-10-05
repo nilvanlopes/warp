@@ -824,6 +824,7 @@ impl AgentDriverRunner {
                             // From here on, refresh credentials via OIDC federation only.
                             manager.set_aws_credentials_refresh_strategy(
                                 AwsCredentialsRefreshStrategy::OidcManaged,
+                                ctx,
                             );
                             refresh_aws_credentials_oidc(config, request_scope, manager, ctx)
                         })

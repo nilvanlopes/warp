@@ -26,6 +26,7 @@ use self::docker::open_docker_container;
 use crate::ai::active_agent_views_model::{ActiveAgentViewsModel, ConversationOrTaskId};
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier;
+use crate::ai::chatgpt_subscription::{CHATGPT_LINK_URI_HOST, ChatGPTSubscriptionModel};
 use crate::cloud_object::ObjectType;
 use crate::drive::{OpenWarpDriveObjectArgs, OpenWarpDriveObjectSettings};
 use crate::features::FeatureFlag;
@@ -128,6 +129,8 @@ pub enum UriHost {
     TabConfig,
     /// Focuses a specific terminal pane by its persistent session UUID.
     Session,
+    /// Result of a browser flow that links a ChatGPT account to the signed-in user.
+    ChatGPTLink,
 }
 
 impl FromStr for UriHost {
@@ -151,6 +154,9 @@ impl FromStr for UriHost {
             "linear" => Ok(Self::Linear),
             "tab_config" if FeatureFlag::TabConfigs.is_enabled() => Ok(Self::TabConfig),
             "session" => Ok(Self::Session),
+            CHATGPT_LINK_URI_HOST if FeatureFlag::ChatGPTSubscription.is_enabled() => {
+                Ok(Self::ChatGPTLink)
+            }
             _ => Err(anyhow!("Received url with unexpected host: {}", s)),
         }
     }
@@ -180,6 +186,14 @@ impl UriHost {
                             log::Level::Info,
                         );
                     });
+            }
+            UriHost::ChatGPTLink => {
+                ChatGPTSubscriptionModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.handle_link_redirect(url, ctx);
+                });
+                if let Some(window_id) = primary_window_id {
+                    ctx.windows().show_window_and_focus_app(window_id);
+                }
             }
             UriHost::Team => {
                 match url.path_segments().into_iter().flatten().last() {
@@ -611,6 +625,8 @@ impl UriHost {
             // Handler picks the window itself based on `?new_window=true`.
             Self::TabConfig => W::Nothing,
             Self::Session => W::Nothing,
+            // The handler focuses the primary window itself once the result is recorded.
+            Self::ChatGPTLink => W::Nothing,
         }
     }
 }
@@ -1768,7 +1784,8 @@ fn validate_custom_uri(url: &Url) -> Result<UriHost> {
         | UriHost::Codex
         | UriHost::Linear
         | UriHost::TabConfig
-        | UriHost::Session => true,
+        | UriHost::Session
+        | UriHost::ChatGPTLink => true,
         // Auth and Home only allow the desktop redirect path
         UriHost::Auth | UriHost::Home => false,
     };
