@@ -6,6 +6,7 @@ pub(crate) mod opencode;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::{fmt, io};
 
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use claude::ClaudeCodePluginManager;
 use codex::CodexPluginManager;
 use gemini::GeminiPluginManager;
 use opencode::OpenCodePluginManager;
+use warpui::r#async::FutureExt as _;
 
 use crate::features::FeatureFlag;
 use crate::terminal::CLIAgent;
@@ -102,9 +104,26 @@ pub(crate) async fn run_cli_command_logged(
 ) -> Result<(), PluginInstallError> {
     let display_cmd = format!("{cli_name} {}", args.join(" "));
     log.push_str(&format!("$ {display_cmd}\n"));
-    let result = executor
-        .execute_local_command_in_login_shell(&display_cmd, None, env_vars)
-        .await;
+    // Windows tools inherit PATH; loading PowerShell profiles again can block without a terminal.
+    #[cfg(windows)]
+    let command = executor.execute_local_command(
+        &display_cmd,
+        None,
+        env_vars,
+        crate::terminal::model::session::ExecuteCommandOptions::default(),
+    );
+    #[cfg(not(windows))]
+    let command = executor.execute_local_command_in_login_shell(&display_cmd, None, env_vars);
+    let result = command
+        .with_timeout(Duration::from_secs(120))
+        .await
+        .map_err(|_| {
+            log.push_str("error: command timed out after 120 seconds\n");
+            PluginInstallError {
+                message: format!("'{display_cmd}' timed out"),
+                log: log.clone(),
+            }
+        })?;
     match result {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

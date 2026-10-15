@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(feature = "local_tty")]
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 #[cfg(feature = "local_tty")]
 use command::r#async::Command;
 #[cfg(feature = "local_tty")]
 use futures::future::{BoxFuture, FutureExt};
+#[cfg(feature = "local_tty")]
+use warpui::r#async::FutureExt as _;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::local_tty::shell::ShellStarter;
@@ -308,6 +312,9 @@ async fn capture_interactive_shell_env(
             // PATH is managed via system/user environment variables rather
             // than login profile scripts, so `-Login` has no practical
             // effect even on PowerShell 7.
+            // Profile modules can block when launched without a terminal.
+            #[cfg(windows)]
+            command.args(["-NoProfile", "-NonInteractive"]);
             command.args(["-Command", command_str.as_str()]);
         }
     }
@@ -319,11 +326,14 @@ async fn capture_interactive_shell_env(
 
     // stdin(null) prevents any prompts from blocking
     let output: std::process::Output = command
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
+        .with_timeout(Duration::from_secs(10))
         .await
+        .map_err(|_| anyhow!("Interactive shell PATH capture timed out"))?
         .map_err(|e| anyhow!("Failed to spawn interactive shell: {}", e))?;
 
     if !output.status.success() {
