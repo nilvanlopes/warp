@@ -262,12 +262,13 @@ impl HiddenComputerUseArgs {
         }
     }
 }
-const HARNESS_VALUE_VARIANTS: [Harness; 5] = [
+const HARNESS_VALUE_VARIANTS: [Harness; 6] = [
     Harness::Oz,
     Harness::Claude,
     Harness::OpenCode,
     Harness::Gemini,
     Harness::Codex,
+    Harness::Pi,
 ];
 
 /// The execution harness for an agent run.
@@ -285,6 +286,7 @@ pub enum Harness {
     Gemini,
     /// Delegate to the `codex` CLI.
     Codex,
+    Pi,
     /// A harness produced by a newer client/server that this client doesn't
     /// recognize. Surfaced via deserialization fallbacks (e.g. unknown GraphQL
     /// enum values, unknown `harness_type` strings); never selectable from the
@@ -311,6 +313,7 @@ impl ValueEnum for Harness {
                 .help("Delegate to the `opencode` CLI"),
             Harness::Gemini => PossibleValue::new("gemini").help("Delegate to the `gemini` CLI"),
             Harness::Codex => PossibleValue::new("codex").help("Delegate to the `codex` CLI"),
+            Harness::Pi => PossibleValue::new("pi"),
             Harness::Unknown => return None,
         };
         if !self.should_display_in_help_text() {
@@ -329,7 +332,9 @@ impl Harness {
     pub fn parse_local_child_harness(value: &str) -> Option<Self> {
         match Self::parse_orchestration_harness(value) {
             Some(harness @ (Self::Claude | Self::OpenCode | Self::Codex)) => Some(harness),
-            Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Unknown) | None => None,
+            Some(Self::Oz) | Some(Self::Gemini) | Some(Self::Pi) | Some(Self::Unknown) | None => {
+                None
+            }
         }
     }
 
@@ -346,7 +351,7 @@ impl Harness {
     pub fn should_display_in_help_text(self) -> bool {
         match self {
             Self::Oz | Self::Claude | Self::Codex => true,
-            Self::OpenCode | Self::Gemini | Self::Unknown => false,
+            Self::OpenCode | Self::Gemini | Self::Pi | Self::Unknown => false,
         }
     }
 
@@ -357,6 +362,7 @@ impl Harness {
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini CLI",
             Self::Codex => "Codex",
+            Self::Pi => "Pi",
             Self::Unknown => "Unknown",
         }
     }
@@ -375,6 +381,7 @@ impl Harness {
             "opencode" => Some(Harness::OpenCode),
             "gemini" => Some(Harness::Gemini),
             "codex" => Some(Harness::Codex),
+            "pi" => Some(Harness::Pi),
             "unknown" => Some(Harness::Unknown),
             _ => None,
         }
@@ -392,6 +399,7 @@ impl Harness {
             Harness::OpenCode => "opencode",
             Harness::Gemini => "gemini",
             Harness::Codex => "codex",
+            Harness::Pi => "pi",
             Harness::Unknown => "unknown",
         }
     }
@@ -401,6 +409,16 @@ impl fmt::Display for Harness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.config_name())
     }
+}
+
+/// How the agent driver talks to a third-party harness.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default, ValueEnum)]
+pub enum HarnessTransport {
+    /// Run the harness CLI interactively inside the driver's terminal session.
+    #[default]
+    Pty,
+    /// Spawn the harness as a child process and drive it over the Agent Client Protocol.
+    Acp,
 }
 
 #[cfg(test)]
@@ -556,12 +574,13 @@ pub struct RunAgentArgs {
     #[arg(
         long = "idle-on-fail",
         value_name = "DURATION",
-        env = "OZ_IDLE_ON_FAIL",
         num_args = 0..=1,
         default_missing_value = "15m",
         hide = true
     )]
     pub idle_on_fail: Option<humantime::Duration>,
+    #[arg(long = "legacy-idle-on-fail-env", env = "OZ_IDLE_ON_FAIL", hide = true)]
+    pub idle_on_fail_env: Option<humantime::Duration>,
 
     #[command(flatten)]
     pub snapshot: SnapshotArgs,
@@ -572,6 +591,14 @@ pub struct RunAgentArgs {
     /// accepting the compatibility shape until all producers have been updated.
     #[arg(long = "task-id", hide = true, conflicts_with_all = ["prompt", "saved_prompt", "file"])]
     pub task_id: Option<String>,
+    /// Execution whose server-owned settings configure this task launch.
+    #[arg(
+        long = "execution-id",
+        env = "WARP_EXECUTION_ID",
+        hide = true,
+        requires = "task_id"
+    )]
+    pub execution_id: Option<String>,
 
     /// Whether we are running the agent in a sandboxed environment.
     #[arg(long = "sandboxed", hide = true)]
@@ -614,6 +641,20 @@ pub struct RunAgentArgs {
     #[arg(long = "harness", value_name = "HARNESS", default_value_t = Harness::Oz, hide = true)]
     pub harness: Harness,
 
+    /// How to drive a third-party harness. Unset means the harness's interactive CLI runs in the
+    /// terminal session; `acp` drives the harness over the Agent Client Protocol instead. Has no
+    /// effect on the `oz` harness.
+    ///
+    /// Cloud workers set this through `WARP_HARNESS_TRANSPORT` rather than the flag, so a pinned
+    /// CLI predating this option ignores it instead of rejecting an unknown argument.
+    #[arg(
+        long = "harness-transport",
+        value_name = "TRANSPORT",
+        env = "WARP_HARNESS_TRANSPORT",
+        hide = true
+    )]
+    pub harness_transport: Option<HarnessTransport>,
+
     /// Skip the initial LLM turn for this run. Used by the empty-prompt cloud-handoff
     /// path so the cloud agent comes up ready for follow-up without hallucinating a
     /// response against an empty user message.
@@ -648,6 +689,10 @@ pub struct RunAgentArgs {
 }
 
 impl RunAgentArgs {
+    pub fn effective_idle_on_fail(&self) -> Option<humantime::Duration> {
+        self.idle_on_fail.or(self.idle_on_fail_env)
+    }
+
     /// Combine `mcp_specs` with legacy `mcp_servers` (UUIDs) into a single list.
     pub fn all_mcp_specs(&self) -> Vec<MCPSpec> {
         let mut specs = self.mcp_specs.clone();
@@ -774,7 +819,7 @@ pub struct RunCloudArgs {
 
     /// Path to a file to attach to the agent query.
     ///
-    /// Can be specified multiple times to attach multiple files (maximum 5).
+    /// Can be specified multiple times to attach multiple files (maximum 25).
     ///
     /// Example: --attach file1.png --attach file2.txt
     #[arg(

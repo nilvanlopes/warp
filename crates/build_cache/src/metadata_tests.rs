@@ -1,10 +1,13 @@
-use std::fs;
+use std::error::Error as _;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use chrono::DateTime;
 use serde_json::{Value, json};
 
-use super::{CacheMetadata, CacheMetadataError, CacheUsage, write_cache_metadata};
+#[cfg(unix)]
+use super::prepare_cache_metadata_directory;
+use super::{CacheMetadataError, CacheUsage, write_cache_metadata};
 
 fn usage(path: &str, mode: &str, targets: &[&str]) -> CacheUsage {
     CacheUsage {
@@ -15,7 +18,7 @@ fn usage(path: &str, mode: &str, targets: &[&str]) -> CacheUsage {
 }
 
 fn metadata_path(root: &Path) -> PathBuf {
-    root.join(".ns/cache-metadata.json")
+    root.join(".ns").join("cache-metadata.json")
 }
 
 fn existing_document(root: &Path, contents: &[u8]) {
@@ -25,6 +28,21 @@ fn existing_document(root: &Path, contents: &[u8]) {
 
 fn read_document(root: &Path) -> Value {
     serde_json::from_slice(&fs::read(metadata_path(root)).unwrap()).unwrap()
+}
+
+fn assert_io_diagnostics(
+    error: &CacheMetadataError,
+    operation: &str,
+    path: &Path,
+    expected_source: &io::Error,
+) {
+    let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+    assert_eq!(source.kind(), expected_source.kind());
+    assert_eq!(source.raw_os_error(), expected_source.raw_os_error());
+    let message = error.to_string();
+    assert!(message.contains(operation), "{message}");
+    assert!(message.contains(&format!("{path:?}")), "{message}");
+    assert!(message.contains(&source.to_string()), "{message}");
 }
 
 #[test]
@@ -42,21 +60,28 @@ fn snapshot_records_mixed_usage_with_sorted_unique_targets() {
 
     write_cache_metadata(root.path(), usages).unwrap();
 
-    let document: CacheMetadata =
-        serde_json::from_slice(&fs::read(metadata_path(root.path())).unwrap()).unwrap();
-    assert_eq!(document.version, 1);
-    assert_eq!(document.user_request.len(), 2);
-    let build = &document.user_request["repos/key/target"];
-    assert_eq!(build.source, "warp");
-    assert_eq!(build.cache_framework.as_deref(), Some("rust"));
-    assert_eq!(build.mount_target, ["/work/a/target", "/work/z/target"]);
-    let git = &document.user_request["git-mirrors"];
-    assert_eq!(git.source, "warp");
-    assert_eq!(git.cache_framework.as_deref(), Some("git"));
-    assert!(git.mount_target.is_empty());
-    assert!(document.updated_at.ends_with('Z'));
+    let document = read_document(root.path());
+    assert_eq!(document.as_object().unwrap().len(), 3);
+    assert_eq!(document["version"], 1);
     assert_eq!(
-        DateTime::parse_from_rfc3339(&document.updated_at)
+        document["user_request"],
+        json!({
+            "repos/key/target": {
+                "source": "warp",
+                "cache_framework": "rust",
+                "mount_target": ["/work/a/target", "/work/z/target"]
+            },
+            "git-mirrors": {
+                "source": "warp",
+                "cache_framework": "git",
+                "mount_target": []
+            }
+        })
+    );
+    let updated_at = document["updated_at"].as_str().unwrap();
+    assert!(updated_at.ends_with('Z'));
+    assert_eq!(
+        DateTime::parse_from_rfc3339(updated_at)
             .unwrap()
             .offset()
             .local_minus_utc(),
@@ -77,11 +102,11 @@ fn snapshot_omits_inherited_usage() {
 
     let document = read_document(root.path());
     assert_eq!(
-        document["userRequest"],
-        json!({"git-mirrors": {"source": "warp", "cacheFramework": "git", "mountTarget": []}})
+        document["user_request"],
+        json!({"git-mirrors": {"source": "warp", "cache_framework": "git", "mount_target": []}})
     );
     assert!(document.get("future").is_none());
-    assert!(document.get("user_request").is_none());
+    assert!(document.get("userRequest").is_none());
 }
 
 #[test]
@@ -92,21 +117,21 @@ fn malformed_document_is_replaced() {
     write_cache_metadata(root.path(), [usage("git-mirrors", "git", &[])]).unwrap();
 
     assert_eq!(
-        read_document(root.path())["userRequest"],
-        json!({"git-mirrors": {"source": "warp", "cacheFramework": "git", "mountTarget": []}})
+        read_document(root.path())["user_request"],
+        json!({"git-mirrors": {"source": "warp", "cache_framework": "git", "mount_target": []}})
     );
 }
 
 #[test]
 fn unsupported_version_is_replaced() {
     let root = tempfile::tempdir().unwrap();
-    existing_document(root.path(), br#"{"version":2,"userRequest":{"old":{}}}"#);
+    existing_document(root.path(), br#"{"version":2,"user_request":{"old":{}}}"#);
 
     write_cache_metadata(root.path(), []).unwrap();
 
     let document = read_document(root.path());
     assert_eq!(document["version"], 1);
-    assert_eq!(document["userRequest"], json!({}));
+    assert_eq!(document["user_request"], json!({}));
 }
 
 #[test]
@@ -120,8 +145,8 @@ fn redundant_relative_components_share_one_normalized_key() {
     write_cache_metadata(&root.path().join("child/.."), usages).unwrap();
 
     assert_eq!(
-        read_document(root.path())["userRequest"],
-        json!({"shared/cache": {"source": "warp", "cacheFramework": "rust", "mountTarget": ["/work/a", "/work/b"]}})
+        read_document(root.path())["user_request"],
+        json!({"shared/cache": {"source": "warp", "cache_framework": "rust", "mount_target": ["/work/a", "/work/b"]}})
     );
 }
 
@@ -139,11 +164,11 @@ fn ambiguous_or_empty_modes_omit_framework() {
     write_cache_metadata(root.path(), usages).unwrap();
 
     assert_eq!(
-        read_document(root.path())["userRequest"],
+        read_document(root.path())["user_request"],
         json!({
-            "shared/cache": {"source": "warp", "mountTarget": ["/work/a", "/work/z"]},
-            "shared/manual": {"source": "warp", "mountTarget": ["/work/manual"]},
-            "shared/mixed": {"source": "warp", "mountTarget": ["/work/known", "/work/unknown"]}
+            "shared/cache": {"source": "warp", "mount_target": ["/work/a", "/work/z"]},
+            "shared/manual": {"source": "warp", "mount_target": ["/work/manual"]},
+            "shared/mixed": {"source": "warp", "mount_target": ["/work/known", "/work/unknown"]}
         })
     );
 }
@@ -188,16 +213,47 @@ fn empty_relative_key_is_rejected() {
 #[test]
 fn blocked_metadata_directory_returns_an_error() {
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join(".ns"), b"not a directory").unwrap();
+    let directory = root.path().join(".ns");
+    fs::write(&directory, b"not a directory").unwrap();
+    let expected_source = fs::create_dir_all(&directory).unwrap_err();
 
-    assert!(matches!(
-        write_cache_metadata(root.path(), []),
-        Err(CacheMetadataError::Io)
-    ));
+    let error = write_cache_metadata(root.path(), []).unwrap_err();
+
+    assert_io_diagnostics(&error, "create directory", &directory, &expected_source);
     assert_eq!(
         fs::read(root.path().join(".ns")).unwrap(),
         b"not a directory"
     );
+}
+
+#[test]
+fn blocked_cache_root_reports_failed_operation() {
+    let root = tempfile::NamedTempFile::new().unwrap();
+    let directory = root.path().join(".ns");
+    #[cfg(not(windows))]
+    let (operation, expected_source) = (
+        "inspect directory",
+        fs::symlink_metadata(&directory).unwrap_err(),
+    );
+    #[cfg(windows)]
+    let (operation, expected_source) = (
+        "create directory",
+        fs::create_dir_all(&directory).unwrap_err(),
+    );
+
+    let error = write_cache_metadata(root.path(), []).unwrap_err();
+
+    assert_io_diagnostics(&error, operation, &directory, &expected_source);
+}
+
+#[test]
+fn empty_cache_root_reports_normalization_failure() {
+    let path = Path::new("");
+    let expected_source = std::path::absolute(path).unwrap_err();
+
+    let error = write_cache_metadata(path, []).unwrap_err();
+
+    assert_io_diagnostics(&error, "normalize cache root", path, &expected_source);
 }
 
 #[test]
@@ -207,10 +263,17 @@ fn failed_replacement_removes_temporary_file() {
     let sentinel = metadata_path(root.path()).join("keep");
     fs::write(&sentinel, b"unchanged").unwrap();
 
-    assert!(matches!(
-        write_cache_metadata(root.path(), [usage("git-mirrors", "git", &[])]),
-        Err(CacheMetadataError::Io)
-    ));
+    let probe = tempfile::NamedTempFile::new_in(root.path().join(".ns")).unwrap();
+    let expected_source = probe.persist(metadata_path(root.path())).unwrap_err().error;
+
+    let error = write_cache_metadata(root.path(), [usage("git-mirrors", "git", &[])]).unwrap_err();
+
+    assert_io_diagnostics(
+        &error,
+        "persist metadata file",
+        &metadata_path(root.path()),
+        &expected_source,
+    );
 
     assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
     assert_eq!(fs::read_dir(root.path().join(".ns")).unwrap().count(), 1);
@@ -234,8 +297,8 @@ fn final_symlink_is_replaced_without_changing_its_target() {
     );
     assert_eq!(fs::read(outside.path()).unwrap(), b"unchanged");
     assert_eq!(
-        read_document(root.path())["userRequest"],
-        json!({"git-mirrors": {"source": "warp", "cacheFramework": "git", "mountTarget": []}})
+        read_document(root.path())["user_request"],
+        json!({"git-mirrors": {"source": "warp", "cache_framework": "git", "mount_target": []}})
     );
 }
 
@@ -250,7 +313,7 @@ fn hardlinked_document_is_replaced_without_changing_other_links() {
     write_cache_metadata(root.path(), []).unwrap();
 
     assert_eq!(fs::read(outside.path()).unwrap(), b"unchanged");
-    assert_eq!(read_document(root.path())["userRequest"], json!({}));
+    assert_eq!(read_document(root.path())["user_request"], json!({}));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -297,8 +360,8 @@ fn fifo_document_is_replaced_without_opening_it() {
             .is_file()
     );
     assert_eq!(
-        read_document(root.path())["userRequest"],
-        json!({"git-mirrors": {"source": "warp", "cacheFramework": "git", "mountTarget": []}})
+        read_document(root.path())["user_request"],
+        json!({"git-mirrors": {"source": "warp", "cache_framework": "git", "mount_target": []}})
     );
 }
 
@@ -308,10 +371,64 @@ fn symlinked_metadata_directory_is_rejected() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), root.path().join(".ns")).unwrap();
+    assert!(matches!(
+        futures::executor::block_on(prepare_cache_metadata_directory(root.path(), |_| async {
+            panic!("symlinked metadata directory must not escalate")
+        })),
+        Err(CacheMetadataError::Symlink)
+    ));
 
     assert!(matches!(
         write_cache_metadata(root.path(), [usage("git-mirrors", "git", &[])]),
         Err(CacheMetadataError::Symlink)
     ));
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_directory_escalates_when_cache_root_is_not_writable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Mutex;
+
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(".ns");
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    let operations = Mutex::new(Vec::new());
+    futures::executor::block_on(prepare_cache_metadata_directory(root.path(), |command| {
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(command.get_program(), "sudo");
+        assert_eq!(args[0], "-n");
+        assert_eq!(Path::new(args.last().unwrap()), directory);
+        if args[1] == "mkdir" {
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+        } else {
+            assert_eq!(args[2], "-h");
+            assert_eq!(args[3], "--");
+            assert_eq!(args[4], crate::current_owner().as_str());
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        operations.lock().unwrap().push(args[1].to_owned());
+        futures::future::ready(Ok(Vec::new()))
+    }))
+    .unwrap();
+    write_cache_metadata(root.path(), [usage("git-mirrors", "git", &[])]).unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        *operations.lock().unwrap(),
+        [
+            std::ffi::OsString::from("mkdir"),
+            std::ffi::OsString::from("chown")
+        ]
+    );
+    assert_eq!(
+        read_document(root.path())["user_request"],
+        json!({"git-mirrors": {"source": "warp", "cache_framework": "git", "mount_target": []}})
+    );
 }

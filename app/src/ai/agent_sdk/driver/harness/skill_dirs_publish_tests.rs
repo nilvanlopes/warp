@@ -18,6 +18,134 @@ fn write_skill(dir: &Path, name: &str) -> PathBuf {
     skill_dir
 }
 
+#[test]
+fn bundled_child_coordination_is_published_to_harness_skill_roots() {
+    let workspace = TempDir::new().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/bundled/harness_skills");
+    let bundled = skill_dirs_from_source_dirs([source]);
+    let skill_root = workspace.path().join("agent/skills");
+    let published = publish_skill_sources(&skill_root, &[], &bundled, None, false).unwrap();
+    let coordination = skill_root.join("oz-child-agent-orchestration");
+    assert!(published.contains(&coordination));
+    assert!(coordination.join("SKILL.md").is_file());
+    assert!(skill_root.join("oz-finish-task/SKILL.md").is_file());
+}
+
+#[test]
+fn required_deferred_skill_reserves_canonical_name_for_claude_codex_and_gemini() {
+    let root = TempDir::new().unwrap();
+    let configured_root = root.path().join("configured");
+    let bundled_root = root.path().join("resources/bundled/skills");
+    fs::create_dir_all(&configured_root).unwrap();
+    fs::create_dir_all(&bundled_root).unwrap();
+    let configured = write_skill(&configured_root, FACTORY_DEFERRED_REPOSITORIES_SKILL);
+    let bundled = write_skill(&bundled_root, FACTORY_DEFERRED_REPOSITORIES_SKILL);
+
+    for relative_root in [".claude/skills", ".agents/skills", ".gemini/skills"] {
+        let skill_root = root.path().join(relative_root);
+        let published = publish_skill_sources(
+            &skill_root,
+            std::slice::from_ref(&configured),
+            &[],
+            Some(&bundled),
+            false,
+        )
+        .unwrap();
+        let canonical = skill_root.join(FACTORY_DEFERRED_REPOSITORIES_SKILL);
+        assert_eq!(published, vec![canonical.clone()]);
+        assert_eq!(fs::read_link(canonical).unwrap(), bundled);
+        assert!(configured.join("SKILL.md").is_file());
+    }
+}
+
+#[test]
+fn required_deferred_skill_preserves_conflicting_targets_in_sandbox_and_fails_outside() {
+    let root = TempDir::new().unwrap();
+    let bundled_root = root.path().join("resources/bundled/skills");
+    fs::create_dir_all(&bundled_root).unwrap();
+    let bundled = write_skill(&bundled_root, FACTORY_DEFERRED_REPOSITORIES_SKILL);
+
+    for relative_root in [".claude/skills", ".agents/skills", ".gemini/skills"] {
+        let skill_root = root.path().join(relative_root);
+        fs::create_dir_all(&skill_root).unwrap();
+        let canonical = skill_root.join(FACTORY_DEFERRED_REPOSITORIES_SKILL);
+        fs::create_dir_all(&canonical).unwrap();
+        fs::write(canonical.join("SKILL.md"), "existing user skill").unwrap();
+
+        assert!(publish_skill_sources(&skill_root, &[], &[], Some(&bundled), false).is_err());
+        assert_eq!(
+            fs::read_to_string(canonical.join("SKILL.md")).unwrap(),
+            "existing user skill"
+        );
+        assert!(
+            !skill_root
+                .join("warp-factory-deferred-repositories")
+                .exists()
+        );
+
+        let published = publish_skill_sources(&skill_root, &[], &[], Some(&bundled), true).unwrap();
+        assert_eq!(published, vec![canonical.clone()]);
+        assert_eq!(fs::read_link(canonical).unwrap(), bundled);
+        assert_eq!(
+            fs::read_to_string(skill_root.join("factory-deferred-repositories.backup/SKILL.md"))
+                .unwrap(),
+            "existing user skill"
+        );
+    }
+}
+
+#[test]
+fn empty_configured_skill_dirs_suppress_ambient_sources() {
+    let workspace = TempDir::new().unwrap();
+
+    let published_root = workspace.path().join("harness/skills");
+    assert!(
+        publish_skills_for_harness(
+            &published_root,
+            workspace.path(),
+            false,
+            &[],
+            false,
+            HarnessSupportSkills::Plugin,
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert!(!published_root.exists());
+}
+
+#[test]
+fn empty_resolved_directories_still_publish_the_required_deferred_skill() {
+    let root = TempDir::new().unwrap();
+    let bundled = write_skill(root.path(), FACTORY_DEFERRED_REPOSITORIES_SKILL);
+    let skill_root = root.path().join(".gemini/skills");
+    let published = publish_skill_sources(&skill_root, &[], &[], Some(&bundled), false).unwrap();
+    let canonical = skill_root.join(FACTORY_DEFERRED_REPOSITORIES_SKILL);
+    assert_eq!(published, vec![canonical.clone()]);
+    assert_eq!(fs::read_link(canonical).unwrap(), bundled);
+}
+
+#[test]
+fn resolved_skill_dirs_are_published_relative_to_workspace_root() {
+    let workspace = TempDir::new().unwrap();
+    let source_dir = workspace.path().join("repo/skills");
+    let skill = write_skill(&source_dir, "factory-skill");
+    let published_root = workspace.path().join("harness/skills");
+    let source_dirs = vec![PathBuf::from("repo/skills")];
+    let published = publish_skills_for_harness(
+        &published_root,
+        workspace.path(),
+        false,
+        &source_dirs,
+        false,
+        HarnessSupportSkills::Plugin,
+    )
+    .unwrap();
+    let link = published_root.join("factory-skill");
+    assert!(published.contains(&link));
+    assert_eq!(fs::read_link(&link).unwrap(), skill);
+}
+
 fn publish_source_dirs(
     skill_root: &Path,
     source_dirs: &[PathBuf],

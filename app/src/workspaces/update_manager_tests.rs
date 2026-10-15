@@ -24,7 +24,10 @@ use crate::workflows::workflow::Workflow;
 use crate::workflows::{CloudWorkflow, CloudWorkflowModel, WorkflowId};
 use crate::workspaces::team::Team;
 use crate::workspaces::user_profiles::UserProfiles;
-use crate::workspaces::workspace::{PurchaseAddOnCreditsPolicy, Workspace, WorkspaceUid};
+use crate::workspaces::user_workspaces::UserWorkspacesEvent;
+use crate::workspaces::workspace::{
+    ChargeUnit, PurchaseAddOnCreditsPolicy, UserTier, Workspace, WorkspaceUid,
+};
 
 fn initialize_app(
     team_client: Arc<dyn TeamClient>,
@@ -83,6 +86,64 @@ fn mock_server_workflow(id: WorkflowId, owner: Owner) -> ServerWorkflow {
 }
 
 #[test]
+fn out_of_band_metadata_refresh_applies_metadata_without_waiting_for_the_receiver() {
+    App::test((), |mut app| async move {
+        let mut attempts = 0;
+        let mut team_client = MockTeamClient::new();
+        team_client
+            .expect_workspaces_metadata()
+            .times(2)
+            .returning(move || {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(anyhow::anyhow!("workspace metadata unavailable"));
+                }
+                Ok(WorkspacesMetadataWithPricing {
+                    metadata: WorkspacesMetadataResponse {
+                        workspaces: vec![],
+                        joinable_teams: vec![],
+                        experiments: None,
+                        ai_credit_availability: None,
+                        user_tier: UserTier {
+                            charge_unit: ChargeUnit::Cents,
+                            ..Default::default()
+                        },
+                    },
+                    pricing_info: None,
+                })
+            });
+        let team_client = Arc::new(team_client);
+        initialize_app(
+            team_client.clone(),
+            Arc::new(MockWorkspaceClient::new()),
+            vec![],
+            &mut app,
+        );
+        let manager = app.add_singleton_model(|ctx| TeamUpdateManager::new(team_client, None, ctx));
+        let (sender, applied) = oneshot::channel();
+        app.update(|ctx| {
+            let mut sender = Some(sender);
+            ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), move |_, event, _| {
+                if matches!(event, UserWorkspacesEvent::TeamsChanged)
+                    && let Some(sender) = sender.take()
+                {
+                    let _ = sender.send(());
+                }
+            });
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            drop(manager.refresh_workspace_metadata(ctx));
+        });
+        applied.await.unwrap();
+
+        app.read(|ctx| {
+            assert_eq!(UserWorkspaces::as_ref(ctx).charge_unit(), ChargeUnit::Cents);
+        });
+    });
+}
+
+#[test]
 fn test_leaving_team_removes_objects() {
     App::test((), |mut app| async move {
         let workspace_uid: WorkspaceUid = WorkspaceUid::from(ServerId::from(987));
@@ -100,7 +161,7 @@ fn test_leaving_team_removes_objects() {
                     joinable_teams: vec![],
                     experiments: None,
                     ai_credit_availability: None,
-                    user_purchase_policy: None,
+                    user_tier: Default::default(),
                 },
                 pricing_info: None,
             })
@@ -172,7 +233,7 @@ fn test_leaving_team_removes_objects() {
                         joinable_teams: vec![],
                         experiments: None,
                         ai_credit_availability: None,
-                        user_purchase_policy: None,
+                        user_tier: Default::default(),
                     },
                     pricing_info: None,
                 }),
@@ -246,7 +307,7 @@ fn test_workspace_metadata_piggyback_feeds_ai_credit_availability() {
                     joinable_teams: vec![],
                     experiments: None,
                     ai_credit_availability: Some(availability),
-                    user_purchase_policy: None,
+                    user_tier: Default::default(),
                 }),
                 ctx,
             );
@@ -259,7 +320,7 @@ fn test_workspace_metadata_piggyback_feeds_ai_credit_availability() {
 }
 
 #[test]
-fn test_poll_path_apply_refreshes_user_purchase_policy() {
+fn test_poll_path_apply_refreshes_user_tier() {
     App::test((), |mut app| async move {
         let team_client = Arc::new(MockTeamClient::new());
         let workspace_client = Arc::new(MockWorkspaceClient::new());
@@ -270,46 +331,61 @@ fn test_poll_path_apply_refreshes_user_purchase_policy() {
 
         // The periodic poll applies metadata through TeamUpdateManager's
         // own on_workspaces_updated; it must refresh the stored user-level
-        // policy.
-        let response_with_policy = WorkspacesMetadataResponse {
+        // tier.
+        let response_with_tier = WorkspacesMetadataResponse {
             workspaces: vec![],
             joinable_teams: vec![],
             experiments: None,
             ai_credit_availability: None,
-            user_purchase_policy: Some(PurchaseAddOnCreditsPolicy {
-                enabled: false,
-                premium_enabled: true,
-                price_premium_bps: 1000,
-            }),
+            user_tier: UserTier {
+                purchase_policy: Some(PurchaseAddOnCreditsPolicy {
+                    enabled: false,
+                    premium_enabled: true,
+                    price_premium_bps: 1000,
+                }),
+                charge_unit: ChargeUnit::Cents,
+            },
         };
         team_update_manager.update(&mut app, |manager, ctx| {
-            manager.on_workspaces_updated(Ok(response_with_policy), ctx);
+            manager.on_workspaces_updated(Ok(response_with_tier), ctx);
         });
         app.read(|ctx| {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
             assert!(
-                UserWorkspaces::as_ref(ctx)
+                user_workspaces
                     .purchase_policy()
                     .is_some_and(|policy| policy.allows_purchases()),
                 "a poll-path apply should store the user-level policy"
             );
+            assert_eq!(
+                user_workspaces.charge_unit(),
+                ChargeUnit::Cents,
+                "a poll-path apply should store the user-level charge unit"
+            );
         });
 
-        // A later poll without the policy must clear the stored fallback so
-        // it can't go stale.
-        let response_without_policy = WorkspacesMetadataResponse {
+        // A later poll without the tier terms must clear the stored fallback
+        // so it can't go stale.
+        let response_without_tier = WorkspacesMetadataResponse {
             workspaces: vec![],
             joinable_teams: vec![],
             experiments: None,
             ai_credit_availability: None,
-            user_purchase_policy: None,
+            user_tier: Default::default(),
         };
         team_update_manager.update(&mut app, |manager, ctx| {
-            manager.on_workspaces_updated(Ok(response_without_policy), ctx);
+            manager.on_workspaces_updated(Ok(response_without_tier), ctx);
         });
         app.read(|ctx| {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
             assert!(
-                UserWorkspaces::as_ref(ctx).purchase_policy().is_none(),
+                user_workspaces.purchase_policy().is_none(),
                 "a poll-path apply without the policy should clear the stored fallback"
+            );
+            assert_eq!(
+                user_workspaces.charge_unit(),
+                ChargeUnit::Credits,
+                "a poll-path apply without the tier should fall back to credits"
             );
         });
     });
@@ -399,7 +475,7 @@ fn on_workspaces_updated_keeps_teams_distinct_and_prunes_a_team_the_response_omi
                     joinable_teams: vec![],
                     experiments: None,
                     ai_credit_availability: None,
-                    user_purchase_policy: None,
+                    user_tier: Default::default(),
                 }),
                 ctx,
             );
@@ -443,7 +519,7 @@ fn on_workspaces_updated_keeps_teams_distinct_and_prunes_a_team_the_response_omi
                     joinable_teams: vec![],
                     experiments: None,
                     ai_credit_availability: None,
-                    user_purchase_policy: None,
+                    user_tier: Default::default(),
                 }),
                 ctx,
             );
@@ -471,7 +547,7 @@ fn on_workspaces_updated_keeps_teams_distinct_and_prunes_a_team_the_response_omi
                     joinable_teams: vec![],
                     experiments: None,
                     ai_credit_availability: None,
-                    user_purchase_policy: None,
+                    user_tier: Default::default(),
                 }),
                 ctx,
             );

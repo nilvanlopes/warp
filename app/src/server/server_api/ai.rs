@@ -8,7 +8,7 @@ use ai::index::full_source_code_embedding::store_client::{IntermediateNode, Stor
 use ai::index::full_source_code_embedding::{
     self, CodebaseContextConfig, ContentHash, EmbeddingConfig, NodeHash, RepoMetadata,
 };
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
@@ -83,6 +83,10 @@ use warp_graphql::platform_error::PlatformErrorInfo;
 use warp_graphql::queries::codebase_context_config::{
     CodebaseContextConfigQuery, CodebaseContextConfigResult, CodebaseContextConfigVariables,
 };
+#[cfg(not(target_family = "wasm"))]
+use warp_graphql::queries::execution_config::{
+    BootstrapTaskResult, ExecutionBootstrap, ExecutionBootstrapVariables, ExecutionConfiguration,
+};
 use warp_graphql::queries::free_available_models::{
     FreeAvailableModels, FreeAvailableModelsInput, FreeAvailableModelsResult,
     FreeAvailableModelsVariables,
@@ -132,7 +136,10 @@ use warp_graphql::queries::task_git_credentials::{
     TaskGitCredentialsLegacyInput, TaskGitCredentialsLegacyResult,
     TaskGitCredentialsLegacyVariables, TaskGitCredentialsResult, TaskGitCredentialsVariables,
 };
+#[cfg(not(target_family = "wasm"))]
+use warp_graphql::queries::task_secrets::{ManagedSecretValue, TaskSecretsInput};
 use warp_multi_agent_api::ConversationData;
+use warp_server_client::PresignedDownloadResponse;
 
 use super::ServerApi;
 #[cfg(not(target_family = "wasm"))]
@@ -181,6 +188,13 @@ use crate::{
 };
 
 const AI_ASSISTANT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) struct ExecutionBootstrapData {
+    pub config: ExecutionConfiguration,
+    pub secrets: anyhow::Result<HashMap<String, ManagedSecretValue>>,
+    pub attachments: anyhow::Result<Vec<TaskAttachment>>,
+}
 
 /// A status update for a task, optionally including a platform error code.
 pub struct TaskStatusUpdate {
@@ -277,6 +291,8 @@ impl TaskStatusUpdate {
 /// JSON payload sent to the public `POST /agent/run` API.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SpawnAgentRequest {
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
     /// None for skill-only or conversation-only invocations; omitted on the wire.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
@@ -1337,6 +1353,7 @@ pub trait AIClient: 'static + Send + Sync {
         environment_uid: Option<String>,
         parent_run_id: Option<String>,
         config: Option<AgentConfigSnapshot>,
+        metadata: HashMap<String, String>,
         team_scope: RequestTeamScope,
     ) -> anyhow::Result<AmbientAgentTaskId, anyhow::Error>;
 
@@ -1579,6 +1596,7 @@ pub trait AIClient: 'static + Send + Sync {
         task_id: String,
         workload_token: String,
         accepts_partial_refresh: bool,
+        use_factory_repositories: bool,
     ) -> Result<TaskGitCredentialsResponse, TaskGitCredentialsError>;
 
     /// Authorizes a REMOTE-2661 debug agent prompt against a retained environment-setup-failure
@@ -1716,7 +1734,67 @@ fn into_file_artifact_record(
     }
 }
 
+fn task_attachments_from_list(
+    attachments: Vec<warp_graphql::queries::task_attachments::TaskAttachment>,
+) -> Vec<TaskAttachment> {
+    attachments
+        .into_iter()
+        .map(|att| TaskAttachment {
+            file_id: att.file_id.into_inner(),
+            filename: att.filename,
+            download_url: att.download_url,
+            mime_type: att.mime_type,
+        })
+        .collect()
+}
+
+fn task_attachments_from_result(result: TaskResult) -> anyhow::Result<Vec<TaskAttachment>> {
+    match result {
+        TaskResult::TaskOutput(output) => Ok(task_attachments_from_list(output.task.attachments)),
+        TaskResult::UserFacingError(error) => Err(anyhow!(get_user_facing_error_message(error))),
+        TaskResult::Unknown => Err(anyhow!("Failed to fetch task attachments")),
+    }
+}
+
 impl ServerApi {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) async fn get_execution_bootstrap(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+        workload_token: String,
+    ) -> anyhow::Result<ExecutionBootstrapData> {
+        let operation = ExecutionBootstrap::build(ExecutionBootstrapVariables {
+            execution_id: execution_id.to_string().into(),
+            supports_deferred_repositories: false,
+            secrets_input: TaskSecretsInput {
+                task_id: task_id.to_string().into(),
+                workload_token,
+            },
+            task_input: TaskInput {
+                task_id: task_id.to_string().into(),
+            },
+            request_context: get_request_context(),
+        });
+        let response = self.send_graphql_request(operation, None).await?;
+        let (config, attachments) = match response.task {
+            BootstrapTaskResult::TaskOutput(output) => (
+                output.task.execution_config,
+                Ok(task_attachments_from_list(output.task.attachments)),
+            ),
+            BootstrapTaskResult::UserFacingError(error) => {
+                return Err(anyhow!(get_user_facing_error_message(error)));
+            }
+            BootstrapTaskResult::Unknown => {
+                return Err(anyhow!("Unknown execution task response"));
+            }
+        };
+        Ok(ExecutionBootstrapData {
+            config,
+            secrets: super::managed_secrets::task_secrets_from_result(response.task_secrets),
+            attachments,
+        })
+    }
     async fn get_public_api_with_team_scope<R>(
         &self,
         path: &str,
@@ -1803,12 +1881,14 @@ impl ServerApi {
         task_id: String,
         workload_token: String,
         accepts_partial_refresh: bool,
+        use_factory_repositories: bool,
     ) -> Result<TaskGitCredentialsResponse, TaskGitCredentialsError> {
         let variables = TaskGitCredentialsVariables {
             input: TaskGitCredentialsInput {
                 task_id: cynic::Id::new(task_id),
                 workload_token,
                 accepts_partial_refresh: Some(accepts_partial_refresh),
+                use_factory_repositories: use_factory_repositories.then_some(true),
             },
             request_context: get_request_context(),
         };
@@ -2435,6 +2515,7 @@ impl AIClient for ServerApi {
         environment_uid: Option<String>,
         parent_run_id: Option<String>,
         config: Option<AgentConfigSnapshot>,
+        metadata: HashMap<String, String>,
         team_scope: RequestTeamScope,
     ) -> anyhow::Result<AmbientAgentTaskId, anyhow::Error> {
         if let Some(config) = &config {
@@ -2462,6 +2543,9 @@ impl AIClient for ServerApi {
                 environment_uid: environment_uid.map(|uid| uid.into()),
                 parent_run_id: parent_run_id.map(|run_id| run_id.into()),
                 agent_config_snapshot,
+                metadata: (!metadata.is_empty())
+                    .then(|| serde_json::to_string(&metadata))
+                    .transpose()?,
             },
             request_context: get_request_context(),
         };
@@ -2797,13 +2881,15 @@ impl AIClient for ServerApi {
         // command and output grid contents.
         let response = self
             .get_public_api_response(&format!(
-                "agent/conversations/{conversation_id}/block-snapshot"
+                "agent/conversations/{conversation_id}/block-snapshot?redirect=false"
             ))
             .await?;
-        let json_bytes = response
-            .bytes()
+        let download = response
+            .json::<PresignedDownloadResponse>()
             .await
-            .map_err(|e| anyhow!("Failed to read block snapshot for {conversation_id}: {e}"))?;
+            .map_err(reqwest::Error::without_url)
+            .context("Failed to decode block snapshot download URL")?;
+        let json_bytes = self.base_client.download_presigned(&download.url).await?;
         SerializedBlock::from_json(&json_bytes)
     }
 
@@ -3027,17 +3113,21 @@ impl AIClient for ServerApi {
         task_id: String,
         workload_token: String,
         accepts_partial_refresh: bool,
+        use_factory_repositories: bool,
     ) -> Result<TaskGitCredentialsResponse, TaskGitCredentialsError> {
         match self
             .get_task_git_credentials_current(
                 task_id.clone(),
                 workload_token.clone(),
                 accepts_partial_refresh,
+                use_factory_repositories,
             )
             .await
         {
             Ok(response) => Ok(response),
-            Err(error) if is_unknown_git_credential_schema_error(&error) => {
+            Err(error)
+                if !use_factory_repositories && is_unknown_git_credential_schema_error(&error) =>
+            {
                 log::info!(
                     "taskGitCredentials partial-refresh fields are unavailable; falling back to the pre-deploy schema"
                 );
@@ -3093,26 +3183,7 @@ impl AIClient for ServerApi {
         let operation = TaskAttachmentsQuery::build(variables);
         let response = self.send_graphql_request(operation, None).await?;
 
-        match response.task {
-            TaskResult::TaskOutput(output) => {
-                let attachments = output
-                    .task
-                    .attachments
-                    .into_iter()
-                    .map(|att| TaskAttachment {
-                        file_id: att.file_id.into_inner(),
-                        filename: att.filename,
-                        download_url: att.download_url,
-                        mime_type: att.mime_type,
-                    })
-                    .collect();
-                Ok(attachments)
-            }
-            TaskResult::UserFacingError(error) => {
-                Err(anyhow!(get_user_facing_error_message(error)))
-            }
-            TaskResult::Unknown => Err(anyhow!("Failed to fetch task attachments")),
-        }
+        task_attachments_from_result(response.task)
     }
 
     async fn create_file_artifact_upload_target(
@@ -3734,6 +3805,7 @@ fn convert_harness(harness: warp_graphql::ai::AgentHarness) -> AIAgentHarness {
         warp_graphql::ai::AgentHarness::Oz => AIAgentHarness::Oz,
         warp_graphql::ai::AgentHarness::ClaudeCode => AIAgentHarness::ClaudeCode,
         warp_graphql::ai::AgentHarness::Gemini => AIAgentHarness::Gemini,
+        warp_graphql::ai::AgentHarness::Pi => AIAgentHarness::Pi,
         warp_graphql::ai::AgentHarness::Codex => AIAgentHarness::Codex,
         warp_graphql::ai::AgentHarness::Other(value) => {
             report_error!(

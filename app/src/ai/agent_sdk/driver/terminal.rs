@@ -29,9 +29,8 @@ use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::attachment_utils::attachments_download_dir;
 use crate::pane_group::NewTerminalOptions;
 use crate::root_view::{NewWorkspaceSource, open_new_with_workspace_source};
-use crate::terminal::TerminalView;
 use crate::terminal::model::RespectObfuscatedSecrets;
-use crate::terminal::model::block::{BlockId, SerializedBlock};
+use crate::terminal::model::block::{BlockId, BlockState, SerializedBlock};
 use crate::terminal::model::find::RegexDFAs;
 use crate::terminal::model::grid::RespectDisplayedOutput;
 use crate::terminal::model::index::Point;
@@ -40,6 +39,7 @@ use crate::terminal::model::terminal_model::ShellProcessInfo;
 use crate::terminal::shared_session::{self, IsSharedSessionCreator, SharedSessionSource};
 use crate::terminal::shell::ShellType;
 use crate::terminal::view::{ConversationRestorationInNewPaneType, Event};
+use crate::terminal::{ShellLaunchData, TerminalView};
 use crate::workspaces::user_workspaces::{HeadlessTeamScope, TeamScope, UserWorkspaces};
 
 /// Describes why a terminal session bootstrap failed.
@@ -143,6 +143,8 @@ pub(crate) enum TerminalDriverEvent {
 /// - Detecting block completion
 pub(crate) struct TerminalDriver {
     terminal_view: ViewHandle<TerminalView>,
+    #[cfg(test)]
+    pub(super) launch_env_vars_for_test: Option<HashMap<OsString, OsString>>,
     /// Sender half of the bootstrap result channel. Exactly one of
     /// `SessionBootstrapped`, `PtySpawnFailed`, or `Exited` (pre-bootstrap)
     /// will send the outcome; all others no-op after the first send.
@@ -154,6 +156,7 @@ pub(crate) struct TerminalDriver {
     /// Receiver for the session sharing result. Present when sharing is expected
     /// and `wait_for_session_shared` has not yet been called.
     session_share_rx: Option<oneshot::Receiver<Result<(), ShareSessionError>>>,
+    session_share_failure_rx: Option<oneshot::Receiver<ShareSessionError>>,
     pending_share_requests: Vec<ShareRequest>,
     /// Resolves the in-flight command's exit status. Sent `Ok` when the
     /// command's block completes, or
@@ -236,11 +239,19 @@ impl TerminalDriver {
         options: TerminalDriverOptions<'_>,
         ctx: &mut AppContext,
     ) -> Result<ModelHandle<Self>, AgentDriverError> {
+        #[cfg(test)]
+        let launch_env_vars_for_test = options.env_vars.clone();
         let should_share = options.should_share;
         let task_id = options.task_id;
         let working_dir = options.working_dir.clone();
         let terminal_view = create_terminal_view(options, ctx)?;
-        Ok(ctx.add_model(|ctx| Self::new(terminal_view, should_share, task_id, working_dir, ctx)))
+        let driver =
+            ctx.add_model(|ctx| Self::new(terminal_view, should_share, task_id, working_dir, ctx));
+        #[cfg(test)]
+        driver.update(ctx, |driver, _| {
+            driver.launch_env_vars_for_test = Some(launch_env_vars_for_test);
+        });
+        Ok(driver)
     }
 
     /// Wrap an already-created terminal view in a new `TerminalDriver` model.
@@ -305,8 +316,15 @@ impl TerminalDriver {
             });
         }
 
+        let (session_share_failure_tx, session_share_failure_rx) = oneshot::channel();
+        let mut session_share_failure_tx = Some(session_share_failure_tx);
         ctx.subscribe_to_view(&terminal_view, move |me, _, event, ctx| {
-            me.handle_terminal_view_event(event, &mut session_share_tx, ctx);
+            me.handle_terminal_view_event(
+                event,
+                &mut session_share_tx,
+                &mut session_share_failure_tx,
+                ctx,
+            );
         });
 
         let (bootstrap_tx_inner, bootstrap_rx) = oneshot::channel::<Result<(), BootstrapError>>();
@@ -329,10 +347,13 @@ impl TerminalDriver {
 
         Self {
             terminal_view,
+            #[cfg(test)]
+            launch_env_vars_for_test: None,
             bootstrap_tx,
             bootstrap_rx: Some(bootstrap_rx),
             shared_session_id: None,
             session_share_rx,
+            session_share_failure_rx: Some(session_share_failure_rx),
             pending_share_requests: Vec::new(),
             waiting_command: None,
             pending_command_start: None,
@@ -444,6 +465,15 @@ impl TerminalDriver {
         });
     }
 
+    /// Sends a raw Ctrl-C (`\x03`) to the PTY, interrupting the foreground process group. Unlike
+    /// [`Self::send_bare_enter_to_cli`] this does not require a CLI agent session, so it also
+    /// reaches harnesses that run as plain commands in the session.
+    pub(super) fn send_interrupt_to_pty(&self, ctx: &mut ModelContext<Self>) {
+        self.terminal_view.update(ctx, |terminal, ctx| {
+            terminal.write_to_pty(b"\x03".to_vec(), ctx);
+        });
+    }
+
     /// The pty's shell process info for this terminal, if the shell has been
     /// spawned and hasn't exited. Used to locate the actual foreground
     /// process group when force-killing a harness that didn't exit
@@ -451,6 +481,12 @@ impl TerminalDriver {
     pub(super) fn shell_process_info(&self, ctx: &AppContext) -> Option<ShellProcessInfo> {
         let terminal = self.terminal_view.as_ref(ctx);
         terminal.model.lock().shell_process_info().copied()
+    }
+
+    /// How this terminal's shell was launched, once the session has resolved it.
+    pub(super) fn active_shell_launch_data(&self, ctx: &AppContext) -> Option<ShellLaunchData> {
+        let terminal = self.terminal_view.as_ref(ctx);
+        terminal.model.lock().active_shell_launch_data().cloned()
     }
 
     /// Return a snapshot of the block with the given ID.
@@ -463,11 +499,17 @@ impl TerminalDriver {
             .map(SerializedBlock::from)
     }
 
-    /// Full visible plaintext of `block_id`'s output grid (no ANSI escape
+    /// Full visible plaintext of `block_id`'s active grid (no ANSI escape
     /// sequences; secrets obfuscated). Used by the harness output monitor
     /// to detect whether the block has stalled — two byte-identical
     /// snapshots taken N seconds apart imply the harness has produced no
     /// new output and no spinner activity.
+    ///
+    /// When the block is in [`BlockState::BeforeExecution`] (preexec has not
+    /// fired yet), terminal output — including shell continuation prompts such
+    /// as `dquote>` from unbalanced quotes — is routed to the command/header
+    /// grid rather than the output grid. We read from there in that state so
+    /// stall detection can observe a stuck continuation prompt.
     ///
     /// We intentionally pass `None` for `max_rows` so we compare the entire
     /// visible output; capping the row count could falsely report "stalled"
@@ -476,7 +518,12 @@ impl TerminalDriver {
         let terminal = self.terminal_view.as_ref(ctx);
         let model = terminal.model.lock();
         let block = model.block_list().block_with_id(block_id)?;
-        Some(block.output_grid().contents_to_string(
+        let grid = if block.state() == BlockState::BeforeExecution {
+            block.prompt_and_command_grid()
+        } else {
+            block.output_grid()
+        };
+        Some(grid.contents_to_string(
             false, // include_escape_sequences
             None,  // max_rows: full visible output
         ))
@@ -739,6 +786,22 @@ impl TerminalDriver {
         }
     }
 
+    pub fn wait_for_session_share_failure(
+        &mut self,
+    ) -> impl Future<Output = AgentDriverError> + use<> {
+        let rx = self.session_share_failure_rx.take();
+
+        async move {
+            let error = match rx {
+                Some(rx) => match rx.await {
+                    Ok(error) => error,
+                    Err(_) => std::future::pending().await,
+                },
+                None => std::future::pending().await,
+            };
+            AgentDriverError::ShareSessionFailed { error }
+        }
+    }
     pub fn extend_shared_session_retention(
         &mut self,
         reason: SessionRetentionReason,
@@ -831,6 +894,7 @@ impl TerminalDriver {
         &mut self,
         event: &crate::terminal::view::Event,
         session_share_tx: &mut Option<oneshot::Sender<Result<(), ShareSessionError>>>,
+        session_share_failure_tx: &mut Option<oneshot::Sender<ShareSessionError>>,
         ctx: &mut ModelContext<Self>,
     ) {
         match event {
@@ -903,6 +967,11 @@ impl TerminalDriver {
                         None => ShareSessionError::Failed(reason.clone()),
                     };
                     let _ = tx.send(Err(error));
+                }
+            }
+            crate::terminal::view::Event::SharedSessionFailed { reason } => {
+                if let Some(tx) = session_share_failure_tx.take() {
+                    let _ = tx.send(ShareSessionError::Failed(reason.clone()));
                 }
             }
             crate::terminal::view::Event::ExecuteCommand(event) => {

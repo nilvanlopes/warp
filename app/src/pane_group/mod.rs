@@ -3844,6 +3844,7 @@ impl PaneGroup {
                 let harness = match cli_conversation.metadata.harness {
                     AIAgentHarness::ClaudeCode => Some(Harness::Claude),
                     AIAgentHarness::Gemini => Some(Harness::Gemini),
+                    AIAgentHarness::Pi => Some(Harness::Pi),
                     AIAgentHarness::Codex => Some(Harness::Codex),
                     AIAgentHarness::Oz => None,
                     AIAgentHarness::Unknown => Some(Harness::Unknown),
@@ -5550,6 +5551,7 @@ impl PaneGroup {
                     let harness = match cli_conversation.metadata.harness {
                         AIAgentHarness::ClaudeCode => Some(Harness::Claude),
                         AIAgentHarness::Gemini => Some(Harness::Gemini),
+                        AIAgentHarness::Pi => Some(Harness::Pi),
                         AIAgentHarness::Codex => Some(Harness::Codex),
                         AIAgentHarness::Oz => None,
                         AIAgentHarness::Unknown => Some(Harness::Unknown),

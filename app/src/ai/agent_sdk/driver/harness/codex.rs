@@ -30,6 +30,7 @@ use super::harness_persistence::{
     HarnessPersistence, PersistenceOutcome, save_transcript_and_block,
 };
 use super::json_utils::read_json_file_or_default;
+use super::skill_dirs_publish::HarnessSupportSkills;
 use super::transcript_persistence::{
     CapturedTranscript, UploadedTranscriptUsage, capture_transcript_with_retry,
     needs_capture_retry, read_jsonl_capture, upload_captured_transcript,
@@ -39,9 +40,7 @@ use super::{
     HarnessRunner, JSONMCPServer, ResumePayload, SavePoint, ThirdPartyHarness, write_temp_file,
 };
 use crate::ai::agent::api::ServerConversationToken;
-use crate::ai::agent_sdk::setup_observability::{
-    OzRunTimelineEvent, SetupClientEventReporter, SetupStep,
-};
+use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::task::HarnessModelConfig;
 use crate::ai::mcp::JSONTransportType;
@@ -138,19 +137,31 @@ impl ThirdPartyHarness for CodexHarness {
         terminal_driver: ModelHandle<TerminalDriver>,
         resume: Option<ResumePayload>,
         resolved_env_vars: &HashMap<OsString, OsString>,
+        skill_dirs: &[PathBuf],
+        factory_repository_contract: bool,
         resolved_secrets: &HashMap<String, ManagedSecretValue>,
         resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
         third_party_harness_model_config: Option<&HarnessModelConfig>,
     ) -> Result<Box<dyn HarnessRunner>, AgentDriverError> {
         // Prepare the environment config files.
         prepare_codex_environment_config(
-            workspace_root,
             harness_working_dir,
             system_prompt,
             resolved_env_vars,
             resolved_secrets,
             resolved_mcp_servers,
             third_party_harness_model_config,
+        )
+        .map_err(|error| AgentDriverError::HarnessConfigSetupFailed {
+            harness: self.cli_agent().command_prefix().to_owned(),
+            error,
+        })?;
+        publish_skills_for_codex(
+            workspace_root,
+            harness_working_dir,
+            skill_dirs,
+            factory_repository_contract,
+            HarnessSupportSkills::Plugin,
         )
         .map_err(|error| AgentDriverError::HarnessConfigSetupFailed {
             harness: self.cli_agent().command_prefix().to_owned(),
@@ -378,7 +389,7 @@ impl HarnessRunner for CodexHarnessRunner {
                 let id = setup_events
                     .record_result(SetupStep::ThirdPartyHarnessExternalConversation, async {
                         self.client
-                            .create_external_conversation(CODEX_CLI_FORMAT)
+                            .create_external_conversation(CODEX_CLI_FORMAT, Harness::Codex)
                             .await
                             .map_err(|e| {
                                 report_error!(&e);
@@ -404,10 +415,6 @@ impl HarnessRunner for CodexHarnessRunner {
             conversation_id,
             block_id: command_handle.block_id().clone(),
         };
-
-        setup_events
-            .post_timeline_event(OzRunTimelineEvent::AgentStarted)
-            .await;
 
         Ok(command_handle)
     }
@@ -525,7 +532,7 @@ impl HarnessRunner for CodexHarnessRunner {
     }
 }
 
-fn capture_transcript_with_usage(
+pub(super) fn capture_transcript_with_usage(
     session_id: Uuid,
     transcript_path: &Path,
     is_final: bool,
@@ -587,8 +594,7 @@ const CODEX_MODEL_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 /// TODO: Ideally, we would make this server-driven so we don't depend on a client
 /// release to change this.
 const CODEX_MODEL_MIGRATIONS_TARGET: &str = "gpt-5.4";
-fn prepare_codex_environment_config(
-    workspace_root: &Path,
+pub(super) fn prepare_codex_environment_config(
     harness_working_dir: &Path,
     system_prompt: Option<&str>,
     resolved_env_vars: &HashMap<OsString, OsString>,
@@ -619,7 +625,6 @@ fn prepare_codex_environment_config(
         third_party_harness_model_config,
         openai_base_url.as_deref(),
     )?;
-    publish_skills_for_codex(workspace_root, harness_working_dir);
     Ok(())
 }
 
@@ -637,14 +642,23 @@ fn prepare_codex_environment_config(
 /// `skill_dirs_publish::publish_skill`), with the conflict-resolution behavior
 /// depending on whether this run is sandboxed (see
 /// `warp_isolation_platform::detect`).
-fn publish_skills_for_codex(workspace_root: &Path, harness_working_dir: &Path) {
+pub(super) fn publish_skills_for_codex(
+    workspace_root: &Path,
+    harness_working_dir: &Path,
+    skill_dirs: &[PathBuf],
+    factory_repository_contract: bool,
+    harness_support_skills: HarnessSupportSkills,
+) -> Result<()> {
     let skill_root = harness_working_dir.join(".agents").join("skills");
     let is_sandbox = warp_isolation_platform::detect().is_some();
     let published = super::skill_dirs_publish::publish_skills_for_harness(
         &skill_root,
         workspace_root,
         is_sandbox,
-    );
+        skill_dirs,
+        factory_repository_contract,
+        harness_support_skills,
+    )?;
     super::skill_dirs_publish::exclude_published_skill_paths_from_git(
         harness_working_dir,
         &published,
@@ -659,6 +673,7 @@ fn publish_skills_for_codex(workspace_root: &Path, harness_working_dir: &Path) {
             )
         );
     }
+    Ok(())
 }
 
 fn codex_config_dir() -> Result<PathBuf> {
