@@ -16,8 +16,8 @@ use warpui::{
 use super::history_model::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
 use super::orchestration_child_tracker::{ChildSignal, OrchestrationChildTracker};
 use super::orchestration_events::{
-    LifecycleEventDetailPayload, LifecycleEventDetailStage, OrchestrationEventService,
-    PendingEvent, PendingEventDetail, build_lifecycle_event,
+    LifecycleEventDetailPayload, OrchestrationEventService, PendingEvent, PendingEventDetail,
+    build_lifecycle_event,
 };
 use crate::ai::agent::conversation::{AIAgentHarness, AIConversationId, ConversationStatus};
 use crate::ai::agent::{AIAgentExchangeId, AIAgentOutputMessageType, ReceivedMessageInput};
@@ -28,7 +28,7 @@ use crate::ai::agent_events::{
 };
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::server::retry_strategies::is_transient_http_error;
-use crate::server::server_api::ai::{AIClient, AgentRunEvent, TaskListFilter};
+use crate::server::server_api::ai::{AIClient, AgentRunEvent, AgentRunEventKind, TaskListFilter};
 use crate::server::server_api::{ServerApi, ServerApiProvider};
 
 /// Backoff schedule (seconds) for the post-restore
@@ -45,15 +45,6 @@ const MAX_KILLED_RUN_IDS: usize = 1024;
 /// Max child runs fetched per cold-start `?ancestor_run_id=` REST seed in
 /// viewer mode. The server caps at 100 regardless.
 const VIEWER_MODE_SEED_FETCH_LIMIT: i32 = 100;
-
-/// Wire `event_type` for a parent's own inbox message events.
-const EVENT_NEW_MESSAGE: &str = "new_message";
-/// Wire `event_type` emitted on a PARENT run when a child task is created
-/// (`AddTask` with `parent_run_id`); the child run id is carried in `ref_id`.
-const EVENT_CHILD_AGENT_STARTED: &str = "child_agent_started";
-/// Wire `event_type` emitted on a CHILD run when its sandbox session links;
-/// the session UUID is carried in `ref_id`.
-const EVENT_RUN_SESSION_LINKED: &str = "run_session_linked";
 
 /// Per-event item delivered from the SSE background task to the entity.
 struct SseStreamItem {
@@ -378,22 +369,22 @@ enum FamilyEvent {
 /// [`FamilyEvent::Opaque`].
 fn classify_family_event(event: &AgentRunEvent, self_run_id: &str) -> FamilyEvent {
     let is_self = event.run_id == self_run_id;
-    match (is_self, event.event_type.as_str()) {
-        (true, EVENT_CHILD_AGENT_STARTED) => match event.ref_id.as_deref() {
+    match (is_self, &event.kind) {
+        (true, AgentRunEventKind::ChildAgentStarted) => match event.ref_id.as_deref() {
             Some(child_run_id) if !child_run_id.is_empty() => FamilyEvent::ChildStarted {
                 child_run_id: child_run_id.to_string(),
             },
             // A discovery event with no child run id is unusable.
             _ => FamilyEvent::Opaque,
         },
-        (false, EVENT_RUN_SESSION_LINKED) => match event.ref_id.as_deref() {
+        (false, AgentRunEventKind::RunSessionLinked) => match event.ref_id.as_deref() {
             Some(session_uuid) if !session_uuid.is_empty() => FamilyEvent::ChildSessionLinked {
                 child_run_id: event.run_id.clone(),
                 session_uuid: session_uuid.to_string(),
             },
             _ => FamilyEvent::Opaque,
         },
-        (false, event_type) => match lifecycle_event_type_from_wire(event_type) {
+        (false, event_type) => match event_type.lifecycle_type() {
             Some(kind) => FamilyEvent::ChildLifecycle {
                 child_run_id: event.run_id.clone(),
                 kind,
@@ -403,11 +394,11 @@ fn classify_family_event(event: &AgentRunEvent, self_run_id: &str) -> FamilyEven
             // path for another run's inbox).
             None => FamilyEvent::Opaque,
         },
-        (true, EVENT_NEW_MESSAGE) => FamilyEvent::ParentSelf(event.clone()),
+        (true, AgentRunEventKind::NewMessage) => FamilyEvent::ParentSelf(event.clone()),
         (true, event_type) => {
             // The parent's own lifecycle events are ParentSelf; unrecognised
             // self events advance the cursor only.
-            if lifecycle_event_type_from_wire(event_type).is_some() {
+            if event_type.lifecycle_type().is_some() {
                 FamilyEvent::ParentSelf(event.clone())
             } else {
                 FamilyEvent::Opaque
@@ -780,7 +771,7 @@ impl OrchestrationEventStreamer {
              child_run_id={child_run_id} name={name:?} parent={parent_conversation_id:?}"
         );
         BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-            history.ensure_remote_child_conversation(
+            let child_conversation_id = history.ensure_remote_child_conversation(
                 terminal_surface_id,
                 parent_conversation_id,
                 child_run_id.clone(),
@@ -789,7 +780,13 @@ impl OrchestrationEventStreamer {
                 fallback_title,
                 harness,
                 ctx,
-            )
+            );
+            history.apply_remote_child_task_snapshot(
+                terminal_surface_id,
+                child_conversation_id,
+                &task,
+                ctx,
+            );
         });
 
         // If a terminal lifecycle event arrived via SSE before this async fetch
@@ -2084,6 +2081,21 @@ impl OrchestrationEventStreamer {
             .is_some_and(|c| c.is_viewing_shared_session() || c.is_remote_child())
     }
 
+    /// True iff this client authors `conversation_id`'s turns, so orchestration events can be
+    /// injected into it as a native MAA request. An external harness (e.g. an ACP agent) owns
+    /// its conversation's task tree client-side; the server has no task to attach injected
+    /// events to and wakes such runs itself, so nothing is queued for them here. Child
+    /// discovery, status tracking, and cursor advancement are unaffected.
+    fn owns_turn_lifecycle(
+        &self,
+        conversation_id: AIConversationId,
+        ctx: &warpui::AppContext,
+    ) -> bool {
+        BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .is_none_or(|conversation| conversation.driver().owns_turn_lifecycle())
+    }
+
     fn should_skip_sse_for_dormant_local_claude_child(
         &self,
         conversation_id: AIConversationId,
@@ -2397,6 +2409,7 @@ impl OrchestrationEventStreamer {
         let config = AgentEventDriverConfig::retry_forever(filter.clone(), cursor);
         let source = ServerApiAgentEventSource::new(server_api);
         let hydrator = self.message_hydrator_for_run_id(&self_run_id);
+        let hydrate_new_messages = self.owns_turn_lifecycle(conversation_id, ctx);
 
         let handle = ctx.spawn(
             async move {
@@ -2404,7 +2417,7 @@ impl OrchestrationEventStreamer {
                     tx,
                     self_run_id,
                     hydrator,
-                    hydrate_new_messages: true,
+                    hydrate_new_messages,
                 };
                 run_agent_event_driver(source, config, &mut consumer).await
             },
@@ -2580,8 +2593,7 @@ impl OrchestrationEventStreamer {
             if event.run_id == self_run_id {
                 continue;
             }
-            let Some(lifecycle_type) = lifecycle_event_type_from_wire(event.event_type.as_str())
-            else {
+            let Some(lifecycle_type) = event.kind.lifecycle_type() else {
                 continue;
             };
             ctx.emit(OrchestrationEventStreamerEvent::WatchedRunStatusChanged {
@@ -2593,6 +2605,16 @@ impl OrchestrationEventStreamer {
 
         let lifecycle_events = convert_lifecycle_events(&events, self_run_id);
         if messages.is_empty() && lifecycle_events.is_empty() {
+            return;
+        }
+        if !self.owns_turn_lifecycle(conversation_id, ctx) {
+            log::info!(
+                "[orch-external-harness] Not queueing {} message(s) and {} lifecycle event(s) \
+                 for conversation {conversation_id:?}: an external harness drives its turns, \
+                 so they cannot be injected into Warp's agent loop",
+                messages.len(),
+                lifecycle_events.len()
+            );
             return;
         }
 
@@ -2752,52 +2774,43 @@ pub(super) fn conversation_status_from_lifecycle_event_type(
     }
 }
 
-/// Maps a wire `event_type` string from the server's `AgentRunEvent`
-/// payload onto the corresponding [`api::LifecycleEventType`]. Returns
-/// `None` for `new_message` (a message event, handled separately) and for
-/// unrecognised event types (forward-compat).
-///
-/// Shared by the orchestration family drain and [`convert_lifecycle_events`],
-/// which builds owner-side
-/// `PendingEventDetail::Lifecycle` items). Keeping the wire-string table
-/// in one place ensures both paths agree on which legacy variants are
-/// recognised.
-fn lifecycle_event_type_from_wire(event_type: &str) -> Option<api::LifecycleEventType> {
-    match event_type {
-        // New canonical event types aligned with task states.
-        "run_in_progress" => Some(api::LifecycleEventType::InProgress),
-        "run_succeeded" => Some(api::LifecycleEventType::Succeeded),
-        "run_failed" => Some(api::LifecycleEventType::Failed),
-        // Legacy event types mapped to new variants for backward compat.
-        #[allow(deprecated)]
-        "run_started" => Some(api::LifecycleEventType::InProgress),
-        #[allow(deprecated)]
-        "run_idle" => Some(api::LifecycleEventType::Succeeded),
-        #[allow(deprecated)]
-        "run_restarted" => Some(api::LifecycleEventType::InProgress),
-        "run_errored" => Some(api::LifecycleEventType::Errored),
-        "run_cancelled" => Some(api::LifecycleEventType::Cancelled),
-        "run_blocked" => Some(api::LifecycleEventType::Blocked),
-        _ => None,
-    }
-}
-
 fn convert_lifecycle_events(events: &[AgentRunEvent], self_run_id: &str) -> Vec<api::AgentEvent> {
     events
         .iter()
-        .filter(|e| e.event_type != "new_message" && e.run_id != self_run_id)
+        .filter(|e| e.run_id != self_run_id)
         .filter_map(|event| {
-            let lifecycle_type = lifecycle_event_type_from_wire(event.event_type.as_str())?;
+            let lifecycle_type = event.kind.lifecycle_type()?;
             let timestamp = parse_occurred_at(&event.occurred_at);
-            // TODO: Parse richer detail payloads (reason, error_message) from
-            // the server event log once the schema supports them.
-            let detail = match lifecycle_type {
-                api::LifecycleEventType::Errored => LifecycleEventDetailPayload {
-                    stage: Some(LifecycleEventDetailStage::Runtime),
-                    reason: event.ref_id.clone(),
+            let detail = match &event.kind {
+                AgentRunEventKind::Failed {
+                    reason,
+                    error_message,
+                }
+                | AgentRunEventKind::Errored {
+                    reason,
+                    error_message,
+                } => LifecycleEventDetailPayload {
+                    reason: reason.clone(),
+                    error_message: error_message.clone(),
                     ..Default::default()
                 },
-                _ => LifecycleEventDetailPayload::default(),
+                AgentRunEventKind::Blocked { blocked_action } => LifecycleEventDetailPayload {
+                    blocked_action: blocked_action.clone(),
+                    ..Default::default()
+                },
+                AgentRunEventKind::Cancelled { reason } => LifecycleEventDetailPayload {
+                    reason: reason.clone(),
+                    ..Default::default()
+                },
+                AgentRunEventKind::InProgress
+                | AgentRunEventKind::Succeeded
+                | AgentRunEventKind::LegacyStarted
+                | AgentRunEventKind::LegacyIdle
+                | AgentRunEventKind::LegacyRestarted
+                | AgentRunEventKind::NewMessage
+                | AgentRunEventKind::ChildAgentStarted
+                | AgentRunEventKind::RunSessionLinked
+                | AgentRunEventKind::Unknown => LifecycleEventDetailPayload::default(),
             };
             let event_id = Uuid::new_v4().to_string();
             Some(build_lifecycle_event(

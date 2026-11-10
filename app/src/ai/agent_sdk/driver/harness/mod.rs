@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use warp_cli::agent::{Harness, HarnessTransport};
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
@@ -26,10 +26,12 @@ use super::{
     OZ_MESSAGE_LISTENER_STATE_ROOT_ENV, WARP_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
     WARP_MESSAGE_LISTENER_STATE_ROOT_ENV,
 };
+use crate::ai::agent::BaseUserQuery;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent_sdk::setup_observability::SetupClientEventReporter;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::task::HarnessModelConfig;
+use crate::ai::attachment_utils::DownloadedAttachment;
 use crate::ai::mcp::JSONMCPServer;
 use crate::server::server_api::ServerApi;
 use crate::server::server_api::harness_support::{HarnessSupportClient, upload_to_target};
@@ -55,7 +57,7 @@ mod skill_dirs_publish;
 mod telemetry;
 mod transcript_persistence;
 mod usage_reporting;
-pub(crate) use acp::{AcpHarness, AcpLaunchSpec};
+use acp::AcpHarness;
 pub(crate) use claude_code::ClaudeHarness;
 use claude_transcript::ClaudeResumeInfo;
 use codex::CodexHarness;
@@ -63,7 +65,7 @@ use codex_transcript::CodexResumeInfo;
 use gemini::GeminiHarness;
 use harness_persistence::{HarnessPersistence, PersistenceOutcome};
 use pi::pi_env_vars;
-pub(crate) use skill_dirs_publish::HarnessSupportSkills;
+pub(crate) use skill_dirs_publish::{HarnessSupportSkills, create_symlink};
 pub(crate) use telemetry::ThirdPartyHarnessTelemetryEvent;
 
 const HARNESS_FAILURE_OUTPUT_TRUNCATION_MARKER: &str = "\n… harness output truncated …\n";
@@ -139,6 +141,16 @@ pub(super) async fn fetch_transcript_envelope<E: serde::de::DeserializeOwned>(
     })
 }
 
+/// The MCP servers resolved for a third-party harness run, keyed by server name.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedMCPServers {
+    /// The config each harness writes into its native format.
+    pub(crate) configs: HashMap<String, JSONMCPServer>,
+    /// The `warp_id` of each server resolved from a managed MCP server or a well-known
+    /// integration, with the semantics of `MCPServerConfig.warp_id`.
+    pub(crate) warp_ids: HashMap<String, String>,
+}
+
 /// Trait for third-party agent harnesses that execute prompts via their own CLIs.
 ///
 /// Each new external harness (e.g. Claude, Codex) implements this to be used with cloud agents.
@@ -178,6 +190,13 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         &[]
     }
 
+    fn runtime_error_patterns_for_run(&self) -> Vec<String> {
+        self.runtime_error_patterns()
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .collect()
+    }
+
     /// Whether this harness must verify its Oz platform plugin before launch.
     /// Codex opts into this because its unattended launch command bypasses hook
     /// trust globally, so we should fail setup instead of running without the
@@ -186,12 +205,22 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         false
     }
 
+    /// Whether the ACP adapter this harness would launch is present in the sandbox: a sidecar
+    /// manifest, or any of the default adapter's names on the oz process PATH. `None` for a
+    /// harness that is not driven over ACP, which never falls back.
+    fn acp_adapter(&self) -> Option<AcpAdapter> {
+        None
+    }
+
     /// Whether the harness runs as an interactive CLI agent in the terminal whose progress is
     /// observed through CLI agent session events and hook plugins. Harnesses that drive a native
     /// conversation directly return `false`.
     fn drives_cli_agent_session(&self) -> bool {
         true
     }
+
+    /// Sets structured initial-prompt files; text-only harnesses ignore them.
+    fn set_initial_attachments(&mut self, _: Vec<DownloadedAttachment>) {}
 
     /// Fetch the harness-specific resume payload for an existing conversation.
     ///
@@ -223,6 +252,10 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
     /// `resolved_secrets` provides the raw typed managed secrets so harnesses
     /// can read structured fields (e.g. `base_url`) without relying on env vars.
     ///
+    /// `prompt_attribution` is the attribution (origin, author, source message) of the query
+    /// that opens this execution, for a harness that echoes `prompt` into the conversation
+    /// itself rather than relaying the server's echo.
+    ///
     /// `skill_dirs` lists the workspace's skill source directories in precedence order.
     ///
     /// `workspace_root` is the root used for workspace-level inputs, while
@@ -237,6 +270,7 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         system_prompt: Option<&str>,
         resumption_prompt: Option<&str>,
         context: Option<&str>,
+        prompt_attribution: Option<&BaseUserQuery>,
         workspace_root: &Path,
         harness_working_dir: &Path,
         task_id: Option<AmbientAgentTaskId>,
@@ -247,7 +281,7 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         skill_dirs: &[PathBuf],
         factory_repository_contract: bool,
         resolved_secrets: &HashMap<String, ManagedSecretValue>,
-        resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
+        resolved_mcp_servers: &ResolvedMCPServers,
         third_party_harness_model_config: Option<&HarnessModelConfig>,
     ) -> Result<Box<dyn HarnessRunner>, AgentDriverError>;
 }
@@ -263,12 +297,28 @@ pub(crate) enum HarnessKind {
 }
 
 impl HarnessKind {
+    pub(crate) fn set_initial_attachments(&mut self, downloaded: Vec<DownloadedAttachment>) {
+        if let Self::ThirdParty(harness) = self {
+            harness.set_initial_attachments(downloaded);
+        }
+    }
     /// Corresponding [`Harness`] enum value.
     pub(crate) fn harness(&self) -> Harness {
         match self {
             HarnessKind::Oz => Harness::Oz,
             HarnessKind::ThirdParty(h) => h.harness(),
             HarnessKind::Unsupported(harness) => *harness,
+        }
+    }
+
+    /// Whether the run tells the server which transport this harness is driven over. Only a
+    /// third-party harness whose transport the client chooses does: the server fixes the
+    /// transport of the others (see [`fixed_transport`]) and rejects a report for them, and
+    /// the transport option it would report is not what drives them anyway.
+    pub(crate) fn reports_transport(&self) -> bool {
+        match self {
+            HarnessKind::ThirdParty(harness) => fixed_transport(harness.harness()).is_none(),
+            HarnessKind::Oz | HarnessKind::Unsupported(_) => false,
         }
     }
 }
@@ -304,6 +354,22 @@ pub(crate) fn renders_natively(harness: Harness, transport: HarnessTransport) ->
     }
 }
 
+/// The transport a third-party harness is always driven over, regardless of the transport
+/// option a run was dispatched with: Pi has no interactive CLI mode, so it only runs over ACP.
+/// `None` for a harness whose transport the option selects. Oz is Warp's own loop and has no
+/// transport at all, so it is `None` too; [`harness_kind`] never consults the option for it.
+pub(crate) fn fixed_transport(harness: Harness) -> Option<HarnessTransport> {
+    match harness {
+        Harness::Pi => Some(HarnessTransport::Acp),
+        Harness::Oz
+        | Harness::Claude
+        | Harness::Codex
+        | Harness::OpenCode
+        | Harness::Gemini
+        | Harness::Unknown => None,
+    }
+}
+
 /// Build a [`HarnessKind`] for the given [`Harness`] and transport.
 ///
 /// We shouldn't ever get a `--harness unknown` here because clap should handle
@@ -312,17 +378,12 @@ pub(crate) fn harness_kind(
     harness: Harness,
     transport: HarnessTransport,
 ) -> Result<HarnessKind, AgentDriverError> {
-    // The transport only selects how a third-party harness is driven; Oz is Warp's own loop
-    // and Pi has no interactive CLI mode, so neither consults it.
-    match harness {
-        Harness::Oz => return Ok(HarnessKind::Oz),
-        Harness::Pi => return acp_harness_kind(harness),
-        Harness::Claude
-        | Harness::Codex
-        | Harness::OpenCode
-        | Harness::Gemini
-        | Harness::Unknown => {}
+    // The transport only selects how a third-party harness is driven; Oz is Warp's own loop,
+    // so it does not consult it, and a harness with a fixed transport ignores it.
+    if harness == Harness::Oz {
+        return Ok(HarnessKind::Oz);
     }
+    let transport = fixed_transport(harness).unwrap_or(transport);
     match transport {
         HarnessTransport::Pty => match harness {
             Harness::Claude => Ok(HarnessKind::ThirdParty(Box::new(ClaudeHarness))),
@@ -337,17 +398,141 @@ pub(crate) fn harness_kind(
     }
 }
 
-/// Resolves the ACP launch for `harness`, failing when the launch table has no entry for it.
-fn acp_harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverError> {
-    let Some(launch) = AcpLaunchSpec::for_harness(harness) else {
-        return Err(AgentDriverError::HarnessSetupFailed {
-            harness: harness.to_string(),
-            reason: format!("The {harness} harness cannot be driven over ACP."),
-        });
+/// Whether the ACP adapter a harness would launch is in the sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AcpAdapter {
+    /// A sidecar manifest names it, or one of the default adapter's names is on the oz process
+    /// PATH.
+    Available,
+    /// Neither, for the given reason.
+    Missing(TransportFallbackReason),
+}
+
+/// Why a run the server requested over ACP is driven over a PTY instead: no sidecar manifest
+/// and no adapter on PATH, told apart by whether a sidecar was mounted at all. Reported to the
+/// server as a bounded reason, so keep the set small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportFallbackReason {
+    /// No coding CLI sidecar is mounted for the harness. Expected on a self-hosted Direct
+    /// backend; elsewhere, such as on a native macOS or Windows image, the image lacks the
+    /// adapter.
+    NoSidecar,
+    /// A sidecar directory is mounted for the harness but has no ACP manifest: the worker
+    /// mounted the terminal CLI image for an ACP run, which is a misconfiguration.
+    SidecarWithoutAdapter,
+}
+
+impl TransportFallbackReason {
+    /// The value reported to the server and in telemetry.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSidecar => "no_sidecar",
+            Self::SidecarWithoutAdapter => "sidecar_without_adapter",
+        }
+    }
+
+    /// What the sandbox lacks, as the notice in the session puts it.
+    fn cause(self) -> &'static str {
+        match self {
+            Self::NoSidecar => "no ACP sidecar is mounted",
+            Self::SidecarWithoutAdapter => "the mounted sidecar has no ACP adapter",
+        }
+    }
+}
+
+impl fmt::Display for TransportFallbackReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Decides whether a run of `harness` over `transport` falls back to a PTY given whether the
+/// ACP adapter is present. Only Claude Code and Codex have a PTY to fall back to: Pi has no
+/// interactive CLI, and Gemini over ACP is not driven in the cloud.
+pub(crate) fn transport_fallback_reason(
+    harness: Harness,
+    transport: HarnessTransport,
+    adapter: AcpAdapter,
+) -> Option<TransportFallbackReason> {
+    match (transport, harness, adapter) {
+        (HarnessTransport::Acp, Harness::Claude | Harness::Codex, AcpAdapter::Missing(reason)) => {
+            Some(reason)
+        }
+        _ => None,
+    }
+}
+
+/// The line the session shows when a run of `harness` falls back to a PTY, so whoever watches
+/// it knows why the run renders in the terminal and what it cannot do. It names the cause in
+/// the words the self-hosting troubleshooting docs look for.
+pub(crate) fn transport_fallback_notice(
+    harness: Harness,
+    reason: TransportFallbackReason,
+) -> String {
+    format!(
+        "oz: {} and no ACP adapter is on PATH, so {} runs in the terminal instead of over ACP. \
+         Follow-ups to this run cannot carry file attachments.",
+        reason.cause(),
+        harness.display_name(),
+    )
+}
+
+/// A command that prints [`transport_fallback_notice`] in the session. The notice is single
+/// quoted, which every shell the driver runs (POSIX shells, fish, PowerShell) prints verbatim,
+/// so any single quote is dropped from it first.
+pub(crate) fn transport_fallback_notice_command(
+    harness: Harness,
+    reason: TransportFallbackReason,
+) -> String {
+    let notice = transport_fallback_notice(harness, reason).replace('\'', "");
+    format!("echo '{notice}'")
+}
+
+/// Replaces an ACP harness whose adapter is absent with the PTY harness for the same CLI, and
+/// records the PTY transport in `transport` so everything that reads it afterwards (the native
+/// prompt queue, the harness environment, the terminal launch, the resume path) follows the
+/// fallback. Returns the reason when a fallback happened.
+pub(crate) fn apply_transport_fallback(
+    kind: &mut HarnessKind,
+    transport: &mut HarnessTransport,
+) -> Result<Option<TransportFallbackReason>, AgentDriverError> {
+    let HarnessKind::ThirdParty(harness) = &*kind else {
+        return Ok(None);
     };
-    Ok(HarnessKind::ThirdParty(Box::new(AcpHarness::new(
-        harness, launch,
-    ))))
+    let Some(adapter) = harness.acp_adapter() else {
+        return Ok(None);
+    };
+    let reason = transport_fallback_reason(harness.harness(), *transport, adapter);
+    if reason.is_some() {
+        *kind = harness_kind(harness.harness(), HarnessTransport::Pty)?;
+        *transport = HarnessTransport::Pty;
+    }
+    Ok(reason)
+}
+
+fn acp_harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverError> {
+    match harness {
+        Harness::Claude | Harness::Codex | Harness::Gemini | Harness::Pi => {
+            Ok(HarnessKind::ThirdParty(Box::new(AcpHarness::new(harness)?)))
+        }
+        Harness::Oz | Harness::OpenCode | Harness::Unknown => {
+            Err(AgentDriverError::HarnessSetupFailed {
+                harness: harness.to_string(),
+                reason: format!("The {harness} harness cannot be driven over ACP."),
+            })
+        }
+    }
+}
+
+/// URL to install instructions for the harness's CLI.
+fn install_docs_url(harness: Harness) -> Option<&'static str> {
+    match harness {
+        Harness::Claude => Some("https://code.claude.com/docs/en/quickstart"),
+        Harness::Codex => Some("https://developers.openai.com/codex/cli"),
+        Harness::Gemini => Some("https://geminicli.com/"),
+        Harness::Pi => Some("https://github.com/svkozak/pi-acp#install"),
+        Harness::Oz | Harness::OpenCode | Harness::Unknown => None,
+    }
 }
 
 /// Returns the harness's auth-check preflight command, if any.
@@ -539,35 +724,50 @@ pub(crate) fn task_env_vars(
 
 /// Returns the per-run environment for a third-party harness.
 ///
-/// Model selection is carried in the environment only for the PTY transport; ACP sessions
-/// select their model through the protocol instead. We use the `ANTHROPIC_MODEL` env var
+/// Claude Code reads its model from `ANTHROPIC_MODEL` on both transports. We use the env var
 /// rather than the `--model` CLI flag because the env var is the most reliable mechanism and
 /// avoids precedence conflicts with Claude Code's `settings.json`.
+///
+/// An ACP session additionally selects the model through the protocol, which only accepts
+/// values the adapter advertises from Claude Code's model picker. The picker lists aliases
+/// such as `opus` and `sonnet`, so `ANTHROPIC_CUSTOM_MODEL_OPTION` adds the requested id as a
+/// picker entry and lets the protocol selection match it verbatim.
 pub(crate) fn harness_env_vars(
     selected_harness: Harness,
     transport: HarnessTransport,
     third_party_harness_model_config: Option<&HarnessModelConfig>,
-) -> Result<HashMap<OsString, OsString>> {
+) -> Result<(HashMap<OsString, OsString>, Option<TempDir>)> {
     let mut env_vars = HashMap::new();
 
     match (selected_harness, transport) {
-        (Harness::Claude, HarnessTransport::Pty) => {
+        (Harness::Claude, transport) => {
             if let Some(model_id) = third_party_harness_model_config
                 .map(|config| config.model_id.as_str())
                 .filter(|id| !id.is_empty())
             {
                 env_vars.insert(OsString::from("ANTHROPIC_MODEL"), OsString::from(model_id));
+                match transport {
+                    HarnessTransport::Acp if model_id != "default" => {
+                        env_vars.insert(
+                            OsString::from("ANTHROPIC_CUSTOM_MODEL_OPTION"),
+                            OsString::from(model_id),
+                        );
+                    }
+                    HarnessTransport::Acp | HarnessTransport::Pty => {}
+                }
             }
         }
-        (Harness::Pi, _) => return pi_env_vars(),
-        (Harness::Claude, HarnessTransport::Acp)
-        | (
+        (Harness::Pi, _) => {
+            let (env_vars, dir) = pi_env_vars()?;
+            return Ok((env_vars, Some(dir)));
+        }
+        (
             Harness::Oz | Harness::OpenCode | Harness::Gemini | Harness::Codex | Harness::Unknown,
             _,
         ) => {}
     }
 
-    Ok(env_vars)
+    Ok((env_vars, None))
 }
 
 /// Indicates when the harness conversation is being saved.
@@ -676,6 +876,13 @@ pub(crate) trait HarnessRunner: Send + Sync + 'static {
     /// Handle a CLI session update such as a prompt submit or completed tool use.
     async fn handle_session_update(&self, _foreground: &ModelSpawner<AgentDriver>) -> Result<()> {
         Ok(())
+    }
+
+    /// Whether the harness is between a turn it has cut short and the follow-up that caused it,
+    /// or still settling an interrupt. A status change observed in that window is not the run
+    /// settling, so the driver must not schedule its exit on it.
+    fn is_settling_turn(&self) -> bool {
+        false
     }
 
     /// Clean up any harness-owned background state after the harness exits.
