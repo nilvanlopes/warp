@@ -5,10 +5,12 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tempfile::{NamedTempFile, TempDir};
+use uuid::Uuid;
 use warp_cli::agent::{Harness, HarnessTransport};
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
@@ -21,10 +23,10 @@ use warpui::{ModelHandle, ModelSpawner, SingletonEntity};
 
 use super::terminal::{CommandHandle, TerminalDriver};
 use super::{
-    AgentDriver, AgentDriverError, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
-    LEGACY_OZ_PARENT_STATE_ROOT_ENV, OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
-    OZ_MESSAGE_LISTENER_STATE_ROOT_ENV, WARP_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV,
-    WARP_MESSAGE_LISTENER_STATE_ROOT_ENV,
+    AgentDriver, AgentDriverError, HarnessSetupStage,
+    LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV, LEGACY_OZ_PARENT_STATE_ROOT_ENV,
+    OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV, OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
+    WARP_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV, WARP_MESSAGE_LISTENER_STATE_ROOT_ENV,
 };
 use crate::ai::agent::BaseUserQuery;
 use crate::ai::agent::api::ServerConversationToken;
@@ -43,14 +45,18 @@ use crate::util::path::resolve_executable;
 pub(crate) mod acp;
 pub(crate) mod claude_code;
 pub(crate) mod claude_transcript;
+mod claude_usage;
 mod codex;
 pub(crate) mod codex_transcript;
+mod codex_usage;
 pub(crate) mod exit_escalation;
 mod gemini;
 mod harness_persistence;
 mod json_utils;
+pub(crate) mod launch_warmup;
 mod pi;
 mod pi_transcript;
+mod pi_usage;
 pub(crate) mod process_control;
 mod save_coordinator;
 mod skill_dirs_publish;
@@ -149,6 +155,32 @@ pub(crate) struct ResolvedMCPServers {
     /// The `warp_id` of each server resolved from a managed MCP server or a well-known
     /// integration, with the semantics of `MCPServerConfig.warp_id`.
     pub(crate) warp_ids: HashMap<String, String>,
+    /// The installation id of each server, which the native conversation records as
+    /// `CallMCPTool.server_id`.
+    pub(crate) installation_ids: HashMap<String, Uuid>,
+    /// Settings that only matter to some harnesses, keyed by server name.
+    pub(crate) harness_settings: HashMap<String, HarnessMcpSettings>,
+}
+
+impl ResolvedMCPServers {
+    pub(crate) fn is_run_scoped(&self, name: &str) -> bool {
+        self.harness_settings
+            .get(name)
+            .is_some_and(|settings| settings.run_scoped)
+    }
+}
+
+/// MCP server settings that only matter to some harnesses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HarnessMcpSettings {
+    /// Variables to forward from the harness's environment, for harnesses that don't give MCP
+    /// servers their whole environment.
+    pub(crate) forwarded_env_vars: Vec<String>,
+    /// How long the harness waits for one of the server's tool calls to finish.
+    pub(crate) tool_timeout: Option<Duration>,
+    /// Whether the server must not outlive the run, so harnesses whose MCP config persists across
+    /// runs pass it per invocation instead.
+    pub(crate) run_scoped: bool,
 }
 
 /// Trait for third-party agent harnesses that execute prompts via their own CLIs.
@@ -172,7 +204,11 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
     /// Validate that the harness is ready to run. Default impl checks that the
     /// CLI is installed on `PATH`; override for additional checks.
     fn validate(&self) -> Result<(), AgentDriverError> {
-        validate_cli_installed(self.cli_agent().command_prefix(), self.install_docs_url())
+        validate_cli_installed(
+            self.cli_agent().command_prefix(),
+            self.install_docs_url(),
+            None,
+        )
     }
 
     /// Shell command to verify authentication credentials are valid.
@@ -210,6 +246,12 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
     /// harness that is not driven over ACP, which never falls back.
     fn acp_adapter(&self) -> Option<AcpAdapter> {
         None
+    }
+
+    /// Directories holding the files this harness loads when it launches, for reading ahead of
+    /// the launch. Empty when they are not known.
+    fn launch_file_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
     }
 
     /// Whether the harness runs as an interactive CLI agent in the terminal whose progress is
@@ -518,6 +560,7 @@ fn acp_harness_kind(harness: Harness) -> Result<HarnessKind, AgentDriverError> {
         Harness::Oz | Harness::OpenCode | Harness::Unknown => {
             Err(AgentDriverError::HarnessSetupFailed {
                 harness: harness.to_string(),
+                stage: Some(HarnessSetupStage::Manifest),
                 reason: format!("The {harness} harness cannot be driven over ACP."),
             })
         }
@@ -554,10 +597,12 @@ pub(crate) fn auth_check_command_for(harness: Harness) -> Option<String> {
 }
 
 /// Check that `cli` is installed and on PATH, returning a `HarnessSetupFailed`
-/// error with an optional install-docs link when it isn't.
+/// error with an optional install-docs link when it isn't. `stage` is the ACP setup stage the
+/// check belongs to, or `None` for a harness driven in the terminal.
 pub(crate) fn validate_cli_installed(
     cli: &str,
     install_docs_url: Option<&str>,
+    stage: Option<HarnessSetupStage>,
 ) -> Result<(), AgentDriverError> {
     if resolve_executable(cli).is_none() {
         let mut reason = format!("'{cli}' CLI not found on your machine.");
@@ -566,6 +611,7 @@ pub(crate) fn validate_cli_installed(
         }
         return Err(AgentDriverError::HarnessSetupFailed {
             harness: cli.into(),
+            stage,
             reason,
         });
     }
@@ -756,6 +802,13 @@ pub(crate) fn harness_env_vars(
                     HarnessTransport::Acp | HarnessTransport::Pty => {}
                 }
             }
+        }
+        (Harness::Codex, HarnessTransport::Acp) => {
+            // The runner already provides isolation; nested bwrap cannot start in its sandbox.
+            env_vars.insert(
+                OsString::from("INITIAL_AGENT_MODE"),
+                OsString::from("agent-full-access"),
+            );
         }
         (Harness::Pi, _) => {
             let (env_vars, dir) = pi_env_vars()?;

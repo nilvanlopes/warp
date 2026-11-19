@@ -31,6 +31,7 @@ use warp_graphql::mutations::confirm_file_artifact_upload::{
 };
 use warp_graphql::mutations::create_agent_task::{
     CreateAgentTask, CreateAgentTaskInput, CreateAgentTaskResult, CreateAgentTaskVariables,
+    CreateLocalAgentTask, CreateLocalAgentTaskResult, LocalAgentTaskOutput,
 };
 use warp_graphql::mutations::create_file_artifact_upload_target::{
     CreateFileArtifactUploadTarget, CreateFileArtifactUploadTargetInput,
@@ -139,7 +140,7 @@ use warp_graphql::queries::task_git_credentials::{
 use warp_graphql::queries::task_restricted_git_credentials::{
     RestrictedTaskGitCredentials, RestrictedTaskGitCredentialsInput,
     RestrictedTaskGitCredentialsOutput, RestrictedTaskGitCredentialsResult,
-    RestrictedTaskGitCredentialsVariables,
+    RestrictedTaskGitCredentialsVariables, TaskGitCredentialProvider,
 };
 #[cfg(not(target_family = "wasm"))]
 use warp_graphql::queries::task_secrets::{ManagedSecretValue, TaskSecretsInput};
@@ -176,6 +177,8 @@ use crate::ai::llms::{
 };
 #[cfg(feature = "agent_mode_evals")]
 use crate::ai::request_usage_model::RequestLimitInfo;
+#[cfg(not(feature = "agent_mode_evals"))]
+use crate::ai::request_usage_model::WorkspaceIncludedUsage;
 use crate::ai::{AICreditAvailability, RequestUsageInfo};
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
 use crate::ai_assistant::requests::GenerateDialogueResult;
@@ -296,6 +299,8 @@ impl TaskStatusUpdate {
 /// JSON payload sent to the public `POST /agent/run` API.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SpawnAgentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_github_coauthor_user_uid: Option<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
     /// None for skill-only or conversation-only invocations; omitted on the wire.
@@ -429,6 +434,8 @@ pub struct RunFollowupRequest {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SendAgentMessageRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_github_coauthor_user_uid: Option<String>,
     pub to: Vec<String>,
     pub subject: String,
     pub body: String,
@@ -461,11 +468,22 @@ pub struct AgentMessageHeader {
 pub struct AgentRunEvent {
     #[serde(flatten)]
     pub kind: AgentRunEventKind,
+    /// The run this event belongs to, including the notified run for `WaitedOn`.
     pub run_id: String,
+    /// Event-specific payload, defined by `kind`; never a subscription or routing key.
     pub ref_id: Option<String>,
     pub execution_id: Option<String>,
     pub occurred_at: String,
     pub sequence: i64,
+}
+
+impl AgentRunEvent {
+    pub fn waited_on_by(&self, recipient_run_id: &str) -> Option<&str> {
+        if self.kind != AgentRunEventKind::WaitedOn || self.run_id != recipient_run_id {
+            return None;
+        }
+        self.ref_id.as_deref().filter(|waiter| !waiter.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,9 +504,14 @@ pub enum AgentRunEventKind {
     Cancelled {
         reason: Option<String>,
     },
+    /// A message arrived for this run; `ref_id` is the message ID.
     NewMessage,
+    /// This run started a child; `ref_id` is the child run ID.
     ChildAgentStarted,
+    /// This run linked a session; `ref_id` is the session UUID.
     RunSessionLinked,
+    /// The event's run is being waited on; `ref_id` identifies the waiter.
+    WaitedOn,
     LegacyStarted,
     LegacyIdle,
     LegacyRestarted,
@@ -506,6 +529,7 @@ impl AgentRunEventKind {
             Self::Errored { .. } => Some(LifecycleEventType::Errored),
             Self::Blocked { .. } => Some(LifecycleEventType::Blocked),
             Self::Cancelled { .. } => Some(LifecycleEventType::Cancelled),
+            Self::WaitedOn => Some(LifecycleEventType::Waiting),
             Self::NewMessage | Self::ChildAgentStarted | Self::RunSessionLinked | Self::Unknown => {
                 None
             }
@@ -540,6 +564,8 @@ impl<'de> serde::Deserialize<'de> for AgentRunEventKind {
             ChildAgentStarted,
             #[serde(rename = "run_session_linked")]
             RunSessionLinked,
+            #[serde(rename = "run_waited_on")]
+            WaitedOn,
             #[serde(rename = "run_started")]
             LegacyStarted,
             #[serde(rename = "run_idle")]
@@ -610,6 +636,7 @@ impl<'de> serde::Deserialize<'de> for AgentRunEventKind {
             WireEventType::NewMessage => Self::NewMessage,
             WireEventType::ChildAgentStarted => Self::ChildAgentStarted,
             WireEventType::RunSessionLinked => Self::RunSessionLinked,
+            WireEventType::WaitedOn => Self::WaitedOn,
             WireEventType::LegacyStarted => Self::LegacyStarted,
             WireEventType::LegacyIdle => Self::LegacyIdle,
             WireEventType::LegacyRestarted => Self::LegacyRestarted,
@@ -660,6 +687,7 @@ impl serde::Serialize for AgentRunEventKind {
             Self::NewMessage => "new_message",
             Self::ChildAgentStarted => "child_agent_started",
             Self::RunSessionLinked => "run_session_linked",
+            Self::WaitedOn => "run_waited_on",
             Self::LegacyStarted => "run_started",
             Self::LegacyIdle => "run_idle",
             Self::LegacyRestarted => "run_restarted",
@@ -710,6 +738,12 @@ pub struct AgentRunClientSetupMetricPayload {
     pub finish_ts: DateTime<Utc>,
     pub latency_ms: i64,
     pub is_error: bool,
+    /// A bounded, event-specific label for how the step turned out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// `acp` or `pty`, when the step belongs to a third-party harness transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct AgentRunEnvironmentSnapshotRequest {
@@ -743,6 +777,8 @@ impl AgentRunClientEventRequest {
         start_timestamp: DateTime<Utc>,
         finish_timestamp: DateTime<Utc>,
         is_error: bool,
+        outcome: Option<String>,
+        transport: Option<String>,
     ) -> Self {
         Self {
             event_uuid: uuid::Uuid::new_v4().to_string(),
@@ -757,6 +793,8 @@ impl AgentRunClientEventRequest {
                         .num_milliseconds()
                         .max(0),
                     is_error,
+                    outcome,
+                    transport,
                 },
             )),
         }
@@ -1217,6 +1255,52 @@ struct ListRunsResponse {
     runs: Vec<AmbientAgentTask>,
 }
 
+#[derive(Debug)]
+pub struct AgentRunsPage {
+    pub runs: Vec<AmbientAgentTask>,
+    pub page_info: AgentRunsPageInfo,
+    /// Wire harness names, retaining unknown variants for duplicate validation.
+    pub harness_names: Vec<Option<String>>,
+}
+
+impl<'de> serde::Deserialize<'de> for AgentRunsPage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct RawPage {
+            runs: Vec<serde_json::Value>,
+            page_info: AgentRunsPageInfo,
+        }
+        let raw = RawPage::deserialize(deserializer)?;
+        let mut runs = Vec::with_capacity(raw.runs.len());
+        let mut harness_names = Vec::with_capacity(raw.runs.len());
+        for row in raw.runs {
+            let harness = row
+                .get("agent_config_snapshot")
+                .or_else(|| row.get("agent_config"))
+                .and_then(|config| config.get("harness"))
+                .and_then(|harness| harness.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            runs.push(serde_json::from_value(row).map_err(serde::de::Error::custom)?);
+            harness_names.push(harness);
+        }
+        Ok(Self {
+            runs,
+            page_info: raw.page_info,
+            harness_names,
+        })
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AgentRunsPageInfo {
+    pub has_next_page: bool,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct ListRunPreviewsResponse {
     pub execution_id: Option<i64>,
@@ -1224,7 +1308,13 @@ pub struct ListRunPreviewsResponse {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub struct RunPreview {}
+pub struct RunPreview {
+    pub port: u16,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
 
 impl<'de> serde::Deserialize<'de> for ListRunsResponse {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1586,6 +1676,13 @@ pub trait AIClient: 'static + Send + Sync {
         team_scope: RequestTeamScope,
     ) -> anyhow::Result<AmbientAgentTaskId, anyhow::Error>;
 
+    async fn create_local_agent_task(
+        &self,
+        prompt: String,
+        config: AgentConfigSnapshot,
+        team_scope: RequestTeamScope,
+    ) -> anyhow::Result<LocalAgentTaskOutput>;
+
     /// Updates a run's server-side record. Every argument is independently optional; omitted
     /// fields are left untouched rather than cleared.
     ///
@@ -1636,6 +1733,12 @@ pub trait AIClient: 'static + Send + Sync {
         filter: TaskListFilter,
         request_team_scope: Option<RequestTeamScope>,
     ) -> anyhow::Result<Vec<AmbientAgentTask>, anyhow::Error>;
+
+    async fn list_agent_runs_page(
+        &self,
+        limit: i32,
+        filter: TaskListFilter,
+    ) -> anyhow::Result<AgentRunsPage>;
 
     /// List agent runs and return the raw server JSON response.
     async fn list_agent_runs_raw(
@@ -1832,7 +1935,9 @@ pub trait AIClient: 'static + Send + Sync {
         &self,
         task_id: String,
         workload_token: String,
+        accepts_partial_refresh: bool,
         use_factory_repositories: bool,
+        providers: Option<Vec<TaskGitCredentialProvider>>,
     ) -> Result<RestrictedTaskGitCredentialsOutput, TaskGitCredentialsError>;
 
     /// Authorizes a REMOTE-2661 debug agent prompt against a retained environment-setup-failure
@@ -2393,6 +2498,7 @@ impl AIClient for ServerApi {
     async fn get_request_limit_info(&self) -> Result<RequestUsageInfo, anyhow::Error> {
         Ok(RequestUsageInfo {
             request_limit_info: RequestLimitInfo::new_for_evals(),
+            workspace_allowances: Default::default(),
             bonus_grants: vec![],
         })
     }
@@ -2408,6 +2514,23 @@ impl AIClient for ServerApi {
         match response.user {
             warp_graphql::queries::get_request_limit_info::UserResult::UserOutput(user_output) => {
                 let request_limit_info = user_output.user.request_limit_info.into();
+
+                let workspace_allowances = user_output
+                    .user
+                    .workspaces
+                    .iter()
+                    .filter_map(|workspace| {
+                        workspace
+                            .included_usage_info
+                            .clone()
+                            .map(|info| WorkspaceIncludedUsage {
+                                workspace_uid: WorkspaceUid::from(ServerId::from_string_lossy(
+                                    workspace.uid.inner(),
+                                )),
+                                info,
+                            })
+                    })
+                    .collect();
 
                 let workspace_and_team_bonus_grants = user_output
                     .user
@@ -2440,6 +2563,7 @@ impl AIClient for ServerApi {
                 Ok(RequestUsageInfo {
                     request_limit_info,
                     bonus_grants,
+                    workspace_allowances,
                 })
             }
             warp_graphql::queries::get_request_limit_info::UserResult::UserFacingError(e) => {
@@ -2786,6 +2910,7 @@ impl AIClient for ServerApi {
 
         let variables = CreateAgentTaskVariables {
             input: CreateAgentTaskInput {
+                local_github_contract_version: None,
                 prompt,
                 environment_uid: environment_uid.map(|uid| uid.into()),
                 parent_run_id: parent_run_id.map(|run_id| run_id.into()),
@@ -2812,6 +2937,35 @@ impl AIClient for ServerApi {
                 Err(anyhow!(get_user_facing_error_message(e)))
             }
             CreateAgentTaskResult::Unknown => Err(anyhow!("failed to create agent task")),
+        }
+    }
+
+    async fn create_local_agent_task(
+        &self,
+        prompt: String,
+        config: AgentConfigSnapshot,
+        team_scope: RequestTeamScope,
+    ) -> anyhow::Result<LocalAgentTaskOutput> {
+        let variables = CreateAgentTaskVariables {
+            input: CreateAgentTaskInput {
+                local_github_contract_version: Some(1),
+                prompt,
+                environment_uid: config.environment_id.clone().map(Into::into),
+                parent_run_id: None,
+                agent_config_snapshot: Some(serde_json::to_string(&config)?),
+                metadata: None,
+            },
+            request_context: get_request_context(),
+        };
+        let response = self
+            .send_graphql_request_for_team(CreateLocalAgentTask::build(variables), team_scope)
+            .await?;
+        match response.create_agent_task {
+            CreateLocalAgentTaskResult::CreateAgentTaskOutput(output) => Ok(output),
+            CreateLocalAgentTaskResult::UserFacingError(error) => {
+                Err(anyhow!(get_user_facing_error_message(error)))
+            }
+            CreateLocalAgentTaskResult::Unknown => Err(anyhow!("Unknown local task response")),
         }
     }
 
@@ -2923,6 +3077,15 @@ impl AIClient for ServerApi {
             .get_public_api_with_team_scope(&url, request_team_scope)
             .await?;
         Ok(response.runs)
+    }
+
+    async fn list_agent_runs_page(
+        &self,
+        limit: i32,
+        filter: TaskListFilter,
+    ) -> anyhow::Result<AgentRunsPage> {
+        self.get_public_api(&build_list_agent_runs_url(limit, &filter))
+            .await
     }
 
     async fn list_agent_runs_raw(
@@ -3389,15 +3552,18 @@ impl AIClient for ServerApi {
         &self,
         task_id: String,
         workload_token: String,
+        accepts_partial_refresh: bool,
         use_factory_repositories: bool,
+        providers: Option<Vec<TaskGitCredentialProvider>>,
     ) -> Result<RestrictedTaskGitCredentialsOutput, TaskGitCredentialsError> {
         let variables = RestrictedTaskGitCredentialsVariables {
             input: RestrictedTaskGitCredentialsInput {
                 task_id: cynic::Id::new(task_id),
                 workload_token,
-                accepts_partial_refresh: Some(false),
+                accepts_partial_refresh: Some(accepts_partial_refresh),
                 use_factory_repositories: use_factory_repositories.then_some(true),
                 github_credential_contract_version: Some(1),
+                providers,
             },
             request_context: get_request_context(),
         };
